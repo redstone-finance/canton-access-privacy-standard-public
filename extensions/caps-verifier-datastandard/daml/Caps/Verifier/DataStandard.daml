@@ -1,0 +1,59 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | A CAPS `Verifier` for data signed in the Canton Data Standard's own
+-- envelope: the standard's default verifier, for an oracle whose nodes sign
+-- the `SignedDataPoint` envelope (`v2-datapoint-hash`) rather than a
+-- vendor-specific payload.
+--
+-- The capsule's `dataPoint` is the signed content: its `publishedAt`,
+-- `schemaVersion` and `values` are the envelope's. The payload adds what the
+-- data point does not carry: the envelope's `expiresAt` and one signature per
+-- node, as a map `{ expiresAt : AVTime, signatures : AVList [AVText] }`. Each
+-- signature is hex DER ECDSA over the SHA-256 of the envelope's structural
+-- root hash, exactly what `DataStandard.Codecs.Verify` checks for a pull-path
+-- consumer. Verification is delegated to that library.
+--
+-- The round commitment is the envelope's structural root hash: the Data
+-- Standard's own `canonicalHash`, so any Data Standard consumer recomputes
+-- it from the data point and `expiresAt` alone. A fixing is fresh within
+-- `maxBehind` and `maxAhead` of the reference time and not past `expiresAt`.
+module Caps.Verifier.DataStandard where
+
+import DA.Time (RelTime)
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.Verifier.DataStandard.Internal.Verification
+
+-- | The verifier. The canonical instance belongs to the operator and must be
+-- visible to publishers through `observers`; a consumer creates its own
+-- instance with the same `signers`, `signerCountThreshold` and window.
+template DataStandardVerifier
+  with
+    owner : Party
+    observers : [Party]
+    signers : [Text]
+      -- ^ The nodes' secp256k1 public keys, hex-encoded DER (SPKI), as a
+      -- `DistributorKeyView.publicKey` carries them.
+    signerCountThreshold : Int
+      -- ^ Minimum number of distinct signers.
+    maxBehind : RelTime
+      -- ^ How far behind the reference time a fixing time may be.
+    maxAhead : RelTime
+      -- ^ How far ahead of the reference time a fixing time may be.
+  where
+    signatory owner
+    observer observers
+    ensure signerCountThreshold > 0 && signerCountThreshold <= length signers
+
+    interface instance Api.Verifier for DataStandardVerifier where
+      view = Api.VerifierView {}
+
+      verifier_verifyImpl _self arg =
+        pure $ verifyContent signers signerCountThreshold arg.capsule.content
+
+      verifier_verifyRoundImpl _self arg =
+        pure $ verifyRound arg.capsule arg.round
+
+      verifier_verifyFreshnessImpl _self arg =
+        pure $ verifyFreshness maxBehind maxAhead arg.capsule arg.asOf

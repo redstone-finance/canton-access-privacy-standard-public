@@ -1,0 +1,34 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | The accountant's sequence of settlements for one distributor and
+-- license. Consumed and re-created by every closing, so two closings on
+-- the same head are a double spend and every settlement numbered by it
+-- gets a number of its own.
+--
+-- Numbers are unique only within one head. Keeping one active head for an
+-- accountant, distributor and license is the accountant's discipline, not
+-- an invariant the ledger enforces; the distributor observes every head
+-- and can tell competing sequences apart.
+module Caps.Accounting.SettlementHead where
+
+import qualified Caps.Api.CoreV1 as Api
+
+template SettlementHead
+  with
+    accountant : Party
+    distributor : Party
+    license : ContractId Api.License
+      -- ^ The license as issued, as the markers name it.
+    nextSequence : Int
+      -- ^ The number the next settlement takes; 1 on a fresh head.
+  where
+    signatory accountant
+    observer distributor
+    ensure nextSequence > 0
+
+    -- | Take the next settlement number and move the head past it.
+    choice SettlementHead_Advance : (Int, ContractId SettlementHead)
+      controller accountant
+      do successor <- create this with nextSequence = nextSequence + 1
+         pure (nextSequence, successor)

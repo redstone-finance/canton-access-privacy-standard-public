@@ -1,0 +1,56 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Retention for rounds. Every publication leaves a round behind, and
+-- nothing in the standard archives it; a consumer verifies a capsule against
+-- the round of its number, so a round stays as long as its capsules may. The
+-- archiver follows the capsule archiver's rule: it keeps the rounds of the
+-- newest round numbers and, past them, each round until a keep period after
+-- its fixing time. The genesis round always stays.
+module Caps.RoundArchiver where
+
+import DA.Foldable (forA_)
+import DA.Time (RelTime)
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.RoundArchiver.Internal.Retention (staleRounds)
+
+-- | The operator's archiver for one data definition. It retires rounds
+-- through `Api.Round_Archive` with its own actor, through the `RoundHead`
+-- and `Round` interfaces alone; the round decides whom it admits.
+template RoundArchiver
+  with
+    operator : Party
+    definition : ContractId Api.DataDefinition
+      -- ^ The data definition whose rounds this archiver retires.
+    keptRounds : Int
+      -- ^ How many of the newest rounds stay regardless of age; at least one,
+      -- so the head's round always stays.
+    keepPeriod : RelTime
+      -- ^ How long after its fixing time an older round stays.
+  where
+    signatory operator
+    ensure keptRounds > 0
+
+    -- | Archive the rounds of `rounds`, the genesis round aside, that are at
+    -- least `keptRounds` rounds behind the latest round of `roundHead` and
+    -- were fixed more than `keepPeriod` ago, and return them. Fails when the
+    -- head or any of the rounds belongs to another definition.
+    nonconsuming choice RoundArchiver_Archive : [ContractId Api.Round]
+      with
+        actor : Party
+        roundHead : ContractId Api.RoundHead
+          -- ^ The definition's round head; its `roundNumber` is the current
+          -- round's.
+        rounds : [ContractId Api.Round]
+      controller actor
+      do
+        headView <- view <$> fetch roundHead
+        assertMsg "round head belongs to another definition" $ headView.definition == definition
+        views <- forA rounds (fmap view . fetch)
+        forA_ views \round ->
+          assertMsg "round belongs to another definition" $ round.definition == definition
+        stale <- map fst <$> staleRounds keptRounds keepPeriod headView.roundNumber (zip rounds views)
+        forA_ stale \round -> exercise round Api.Round_Archive with actor
+
+        pure stale

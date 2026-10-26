@@ -1,0 +1,632 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Tests of the reference implementation against the test verifier:
+-- bootstrap, publication and its rejections, distribution, sublicensing,
+-- revocation, and the visibility claims the standard makes.
+module Test.CoreTest where
+
+import DA.Assert ((===))
+import DA.List (sort)
+import qualified DA.TextMap as TM
+import DA.Time (addRelTime, days, hours, minutes)
+import Daml.Script
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.Core.Capsule (Capsule(..))
+import Caps.Core.DataDefinition
+import Caps.Core.License (License(..), License_Revoke(..))
+import Caps.Core.Round (Round(..))
+import Caps.Core.RoundHead (RoundHead(..), RoundHead_Pause(..), RoundHead_Resume(..))
+import Caps.Test.Fixtures.TestVerifier
+import DataStandard.DataPointV1
+  (PublishedDataPoint, PublishedDataPoint_Fetch(..), PublishedDataPointView(..))
+import DataStandard.Utils (AnyValue(..), emptyMetadata)
+
+-- Fixture -------------------------------------------------------------------
+
+data Feed = Feed with
+    operator : Party
+    auditor1 : Party
+    auditor2 : Party
+    reader : Party
+    licensee : Party
+    client1 : Party
+    client2 : Party
+    publisher : Party
+    stranger : Party
+    verifier : ContractId Api.Verifier
+    definition : ContractId Api.DataDefinition
+    head : ContractId Api.RoundHead
+    rootLicense : ContractId Api.License
+
+nodesTag : Text
+nodesTag = "signed-by-nodes"
+
+-- | Bootstrap a feed: verifier, proposal accepted by both auditors,
+-- finalization, root license naming `licensee` and `publisher`. A choice can
+-- only be exercised on contracts its submitter can see, so a publisher must
+-- see the head, the verifier and the root license: the publisher here is a
+-- reader and a licensee, the stranger uses disclosure.
+setup : Script Feed
+setup = do
+  operator <- allocateParty "Operator"
+  auditor1 <- allocateParty "Auditor1"
+  auditor2 <- allocateParty "Auditor2"
+  reader <- allocateParty "Reader"
+  licensee <- allocateParty "Licensee"
+  client1 <- allocateParty "Client1"
+  client2 <- allocateParty "Client2"
+  publisher <- allocateParty "Publisher"
+  stranger <- allocateParty "Stranger"
+
+  verifierCid <- submit operator $ createCmd TestVerifier with
+    owner = operator, acceptedTag = nodesTag, observers = [reader, publisher]
+    maxBehind = hours 1, maxAhead = minutes 5
+  let verifier = toInterfaceContractId @Api.Verifier verifierCid
+
+  proposal0 <- submit operator $ createCmd DefinitionProposal with
+    dataId = "BTC/USD"
+    operator
+    auditors = [auditor1, auditor2]
+    readers = [reader, publisher]
+    verifier
+    publishers = None
+    accepted = []
+  proposal1 <- submit auditor1 $ exerciseCmd proposal0 DefinitionProposal_Accept with auditor = auditor1
+  -- The operator cannot finalize before every auditor has accepted.
+  submitMustFailWith (actAs operator) "not all auditors have accepted" $
+    exerciseCmd proposal1 DefinitionProposal_Finalize
+  proposal2 <- submit auditor2 $ exerciseCmd proposal1 DefinitionProposal_Accept with auditor = auditor2
+  (definitionCid, headCid) <- submit operator $ exerciseCmd proposal2 DefinitionProposal_Finalize
+  let definition = toInterfaceContractId @Api.DataDefinition definitionCid
+      head = toInterfaceContractId @Api.RoundHead headCid
+
+  rootLicense <- createRootLicense operator [licensee, publisher] definition
+
+  -- The genesis round carries the bootstrap time and a fixing must be
+  -- strictly later; on the static-time test ledger that means moving on.
+  passTime (minutes 1)
+  pure Feed with ..
+
+-- | A data point as the publisher would build it: the fixing time is `at`,
+-- the distributor the operator.
+dataPointAt : Feed -> Time -> Decimal -> PublishedDataPointView
+dataPointAt feed at price = PublishedDataPointView with
+  distributor = feed.operator
+  publishedAt = at
+  schemaVersion = "quote-1"
+  values = TM.fromList [("feedId", AVText "BTC/USD"), ("price", AVDecimal price)]
+  metadata = emptyMetadata
+
+contentAt : Feed -> Time -> Decimal -> Api.CapsuleContent
+contentAt feed at price = Api.CapsuleContent with
+  dataPoint = dataPointAt feed at price
+  payload = AVText nodesTag
+  license = feed.rootLicense
+
+-- | Publish a round at `at` on `head`, as `actor`.
+publish : Feed -> Party -> ContractId Api.RoundHead -> Time -> Decimal -> Script Api.CreateRoundResult
+publish feed actor head at price = do
+  submit actor $ exerciseCmd head Api.RoundHead_CreateRound with
+    actor
+    content = contentAt feed at price
+
+createRootLicense : Party -> [Party] -> ContractId Api.DataDefinition -> Script (ContractId Api.License)
+createRootLicense operator licensees definition =
+  toInterfaceContractId @Api.License <$> submit operator (createCmd License with
+    definition
+    owner = operator
+    licensor = operator
+    operator
+    licensees
+    licenseType = AVText "root"
+    validUntil = None
+    delegate = None)
+
+bootstrapDefinition
+  : Feed -> Text -> Optional [Party] -> Script (ContractId Api.DataDefinition, ContractId Api.RoundHead)
+bootstrapDefinition feed dataId publishers = do
+  proposal <- submit feed.operator $ createCmd DefinitionProposal with
+    dataId, operator = feed.operator, auditors = [], readers = [feed.reader, feed.publisher]
+    verifier = feed.verifier, publishers, accepted = []
+  (definitionCid, headCid) <- submit feed.operator $ exerciseCmd proposal DefinitionProposal_Finalize
+  pure (toInterfaceContractId definitionCid, toInterfaceContractId headCid)
+
+-- | Submit and expect the transaction to fail on the assertion carrying
+-- `message`, so that a rejection test cannot pass for another reason, such
+-- as a contract the submitter does not see.
+submitMustFailWith : SubmitOptions -> Text -> Commands a -> Script ()
+submitMustFailWith opts message commands = do
+  result <- trySubmit opts commands
+  case result of
+    Left (FailureStatusError status) -> status.message === message
+    Left other -> fail $ "unexpected failure: " <> show other
+    Right _ -> fail "expected the submission to fail"
+
+-- Publication ---------------------------------------------------------------
+
+testBootstrapCreatesGenesis : Script ()
+testBootstrapCreatesGenesis = do
+  feed <- setup
+  [(_, genesis)] <- query @Round feed.reader
+  genesis.roundNumber === 0
+  genesis.definition === feed.definition
+  Some headView <- queryInterfaceContractId feed.reader feed.head
+  headView.isPaused === False
+  headView.definition === feed.definition
+
+testGenesisCarriesNoDataHash : Script ()
+testGenesisCarriesNoDataHash = do
+  feed <- setup
+  [(_, genesis)] <- query @Round feed.reader
+  genesis.dataHash === ""
+
+testDefinitionNamesItsVerifier : Script ()
+testDefinitionNamesItsVerifier = do
+  feed <- setup
+  Some definitionView <- queryInterfaceContractId feed.reader feed.definition
+  definitionView === Api.DataDefinitionView with dataId = "BTC/USD", verifier = feed.verifier
+
+testPublishRound : Script ()
+testPublishRound = do
+  feed <- setup
+  now <- getTime
+  result <- publish feed feed.publisher feed.head now 50000.0
+
+  -- The old head is consumed, the new one points at round 1.
+  None <- queryInterfaceContractId feed.reader feed.head
+  Some headView <- queryInterfaceContractId feed.reader result.head
+  headView.round === result.round
+  headView.roundNumber === 1
+  Some roundView <- queryInterfaceContractId feed.reader result.round
+  roundView.roundNumber === 1
+  roundView.timestamp === now
+  roundView.dataHash === testCommitment (dataPointAt feed now 50000.0)
+
+  -- The root capsule is visible to the operator, the auditors and the
+  -- licensees of the root license (the publisher is one), and to nobody
+  -- else: not to readers.
+  Some _ <- queryInterfaceContractId feed.operator result.capsule
+  Some _ <- queryInterfaceContractId feed.auditor1 result.capsule
+  Some _ <- queryInterfaceContractId feed.licensee result.capsule
+  Some _ <- queryInterfaceContractId feed.publisher result.capsule
+  None <- queryInterfaceContractId feed.reader result.capsule
+
+  -- Two consecutive rounds advance the chain.
+  passTime (minutes 1)
+  later <- getTime
+  result2 <- publish feed feed.publisher result.head later 50100.0
+  Some roundView2 <- queryInterfaceContractId feed.reader result2.round
+  roundView2.roundNumber === 2
+  pure ()
+
+testPublicationIsOpen : Script ()
+testPublicationIsOpen = do
+  feed <- setup
+  now <- getTime
+  -- A party with no relation to the feed cannot see the head, so it cannot
+  -- exercise on it...
+  submitMustFail feed.stranger $ exerciseCmd feed.head Api.RoundHead_CreateRound with
+    actor = feed.stranger, content = contentAt feed now 50000.0
+  -- ...but with the head, the verifier and the root license disclosed to
+  -- it, and no round, it can publish authentic data: the authority to sign
+  -- the round comes from the head, not from the caller.
+  Some headDisc <- queryDisclosure feed.reader (fromInterfaceContractId @RoundHead feed.head)
+  Some verifierDisc <- queryDisclosure feed.reader (fromInterfaceContractId @TestVerifier feed.verifier)
+  Some licenseDisc <- queryDisclosure feed.operator (fromInterfaceContractId @License feed.rootLicense)
+  result <- submit (actAs feed.stranger <> disclose headDisc
+                    <> disclose verifierDisc <> disclose licenseDisc) $
+    exerciseCmd feed.head Api.RoundHead_CreateRound with
+      actor = feed.stranger, content = contentAt feed now 50000.0
+  Some roundView <- queryInterfaceContractId feed.reader result.round
+  roundView.roundNumber === 1
+
+testRejectsNonMonotonicFixingTime : Script ()
+testRejectsNonMonotonicFixingTime = do
+  feed <- setup
+  now <- getTime
+  result <- publish feed feed.publisher feed.head now 50000.0
+  -- Same fixing time as the previous round: refused.
+  submitMustFailWith (actAs feed.publisher) "fixing time not after the previous round" $
+    exerciseCmd result.head Api.RoundHead_CreateRound with
+      actor = feed.publisher, content = contentAt feed now 50000.0
+
+testRejectsFixingTimeOutsideWindow : Script ()
+testRejectsFixingTimeOutsideWindow = do
+  feed <- setup
+  passTime (days 1)
+  now <- getTime
+  let stale = contentAt feed (addRelTime now (negate (hours 2))) 50000.0
+      future = contentAt feed (addRelTime now (minutes 10)) 50000.0
+  submitMustFailWith (actAs feed.publisher) "the verifier rejected the fixing time: [\"fixing time too far in the past\"]" $
+    exerciseCmd feed.head Api.RoundHead_CreateRound with
+      actor = feed.publisher, content = stale
+  submitMustFailWith (actAs feed.publisher) "the verifier rejected the fixing time: [\"fixing time too far in the future\"]" $
+    exerciseCmd feed.head Api.RoundHead_CreateRound with
+      actor = feed.publisher, content = future
+
+testRejectsInauthenticPayload : Script ()
+testRejectsInauthenticPayload = do
+  feed <- setup
+  now <- getTime
+  submitMustFailWith (actAs feed.publisher) "the verifier rejected the content: [\"payload is not authentic\"]" $
+    exerciseCmd feed.head Api.RoundHead_CreateRound with
+      actor = feed.publisher
+      content = (contentAt feed now 50000.0) with payload = AVText "forged"
+
+testRejectsForeignLicense : Script ()
+testRejectsForeignLicense = do
+  feed <- setup
+  now <- getTime
+  -- A license owned by someone other than the operator cannot back a root
+  -- capsule, even for the right definition. The publisher is a licensee of
+  -- it, so it sees the license and the head reaches the ownership check.
+  foreignCid <- submit feed.licensee $ createCmd License with
+    definition = feed.definition, owner = feed.licensee, licensor = feed.operator
+    operator = feed.operator, licensees = [feed.publisher], licenseType = AVText "x"
+    validUntil = None, delegate = None
+  submitMustFailWith (actAs feed.publisher) "root license must be owned by the operator" $
+    exerciseCmd feed.head Api.RoundHead_CreateRound with
+      actor = feed.publisher
+      content = (contentAt feed now 50000.0) with license = toInterfaceContractId foreignCid
+
+testRejectsLicenseOfAnotherDefinition : Script ()
+testRejectsLicenseOfAnotherDefinition = do
+  feed <- setup
+  now <- getTime
+  (otherDefinition, _) <- bootstrapDefinition feed "ETH/USD" None
+  license <- createRootLicense feed.operator [feed.licensee, feed.publisher] otherDefinition
+  submitMustFailWith (actAs feed.publisher) "license belongs to another definition" $
+    exerciseCmd feed.head Api.RoundHead_CreateRound with
+      actor = feed.publisher
+      content = (contentAt feed now 50000.0) with license
+
+testRejectsDataPointOfAnotherDistributor : Script ()
+testRejectsDataPointOfAnotherDistributor = do
+  feed <- setup
+  now <- getTime
+  let dataPoint = (dataPointAt feed now 50000.0) with distributor = feed.publisher
+  submitMustFailWith (actAs feed.publisher) "root capsule must be distributed by the operator" $
+    exerciseCmd feed.head Api.RoundHead_CreateRound with
+      actor = feed.publisher
+      content = (contentAt feed now 50000.0) with dataPoint
+
+testRejectsPublisherNotAdmitted : Script ()
+testRejectsPublisherNotAdmitted = do
+  feed <- setup
+  (definition, head) <- bootstrapDefinition feed "ETH/USD" (Some [])
+  license <- createRootLicense feed.operator [feed.licensee, feed.publisher] definition
+  passTime (minutes 1)
+  now <- getTime
+  submitMustFailWith (actAs feed.publisher) "publisher not admitted" $
+    exerciseCmd head Api.RoundHead_CreateRound with
+      actor = feed.publisher
+      content = (contentAt feed now 50000.0) with license
+
+testRaceOnHead : Script ()
+testRaceOnHead = do
+  feed <- setup
+  now <- getTime
+  _ <- publish feed feed.publisher feed.head now 50000.0
+  -- A second publication against the consumed head fails entirely.
+  submitMustFail feed.publisher $ exerciseCmd feed.head Api.RoundHead_CreateRound with
+    actor = feed.publisher, content = contentAt feed (addRelTime now (minutes 1)) 50100.0
+
+testPauseAndResume : Script ()
+testPauseAndResume = do
+  feed <- setup
+  now <- getTime
+  pausedCid <- submit feed.auditor1 $ exerciseCmd (fromInterfaceContractId @RoundHead feed.head)
+    RoundHead_Pause with auditor = feed.auditor1
+  let paused = toInterfaceContractId @Api.RoundHead pausedCid
+  submitMustFailWith (actAs feed.publisher) "publication is paused" $
+    exerciseCmd paused Api.RoundHead_CreateRound with
+      actor = feed.publisher, content = contentAt feed now 50000.0
+  -- A reader sees the head but is no auditor, so it cannot resume.
+  submitMustFailWith (actAs feed.reader) "not an auditor" $
+    exerciseCmd pausedCid RoundHead_Resume with auditor = feed.reader
+  resumedCid <- submit feed.auditor2 $ exerciseCmd pausedCid RoundHead_Resume with auditor = feed.auditor2
+  _ <- publish feed feed.publisher (toInterfaceContractId resumedCid) now 50000.0
+  pure ()
+
+-- | A proposal that will not be finalized is cancelled by the operator,
+-- with the acceptors' authority from the contract. Nobody else touches it.
+testProposalCanBeCancelled : Script ()
+testProposalCanBeCancelled = do
+  feed <- setup
+  let newProposal = submit feed.operator $ createCmd DefinitionProposal with
+        dataId = "ETH/USD", operator = feed.operator, auditors = [feed.auditor1, feed.auditor2]
+        readers = [feed.reader], verifier = feed.verifier, publishers = None, accepted = []
+  proposal0 <- newProposal
+  proposal1 <- submit feed.auditor1 $ exerciseCmd proposal0 DefinitionProposal_Accept with auditor = feed.auditor1
+  -- Once an auditor has accepted, the operator cannot archive the proposal
+  -- directly, and no auditor can cancel it.
+  submitMustFail feed.operator $ archiveCmd proposal1
+  submitMustFail feed.auditor1 $ exerciseCmd proposal1 DefinitionProposal_Cancel
+  submit feed.operator $ exerciseCmd proposal1 DefinitionProposal_Cancel
+  remaining <- queryContractId feed.operator proposal1
+  remaining === None
+
+testOperatorCannotArchiveAlone : Script ()
+testOperatorCannotArchiveAlone = do
+  feed <- setup
+  submitMustFail feed.operator $ archiveCmd (fromInterfaceContractId @RoundHead feed.head)
+  submitMustFail feed.operator $ archiveCmd (fromInterfaceContractId @DataDefinition feed.definition)
+  [(genesis, _)] <- query @Round feed.reader
+  submitMustFail feed.operator $ archiveCmd genesis
+
+-- | A round is co-signed by the auditors, so the operator cannot create one
+-- outside the chain, whatever number or commitment it claims.
+testOperatorCannotMintARoundAlone : Script ()
+testOperatorCannotMintARoundAlone = do
+  feed <- setup
+  [(_, genesis)] <- query @Round feed.reader
+  now <- getTime
+  submitMustFail feed.operator $ createCmd genesis with
+    roundNumber = 1, timestamp = now, dataHash = "forged"
+
+-- | Two rounds after the genesis round, a minute apart; returns them.
+publishTwo feed = do
+  first <- getTime
+  result1 <- publish feed feed.publisher feed.head first 50000.0
+  passTime (minutes 1)
+  second <- getTime
+  result2 <- publish feed feed.publisher result1.head second 50100.0
+  pure (result1.round, result2.round)
+
+testOperatorRetiresAnOlderRound : Script ()
+testOperatorRetiresAnOlderRound = do
+  feed <- setup
+  (round1, _) <- publishTwo feed
+  -- The operator retires round 1 with the auditors' authority the round
+  -- carries.
+  submit feed.operator $ exerciseCmd round1 Api.Round_Archive with actor = feed.operator
+  None <- queryInterfaceContractId feed.reader round1
+  pure ()
+
+testGenesisRoundIsLeftToTheArchiver : Script ()
+testGenesisRoundIsLeftToTheArchiver = do
+  feed <- setup
+  _ <- publishTwo feed
+  -- The round checks only its actor; keeping the genesis round is an
+  -- archiver's rule, since nothing on the ledger needs it.
+  [(genesis, _)] <- filter (\(_, round) -> round.roundNumber == 0) <$> query @Round feed.reader
+  submit feed.operator $ exerciseCmd (toInterfaceContractId @Api.Round genesis) Api.Round_Archive with
+    actor = feed.operator
+  None <- queryContractId feed.reader genesis
+  pure ()
+
+-- | Retiring the latest round does not stop publication: the head carries
+-- the latest round's number and fixing time, so a publication fetches no
+-- round. Keeping the latest round is an archiver's rule too.
+testPublicationSurvivesArchivingTheLatestRound : Script ()
+testPublicationSurvivesArchivingTheLatestRound = do
+  feed <- setup
+  now <- getTime
+  result1 <- publish feed feed.publisher feed.head now 50000.0
+  submit feed.operator $ exerciseCmd result1.round Api.Round_Archive with actor = feed.operator
+  None <- queryInterfaceContractId feed.reader result1.round
+  passTime (minutes 1)
+  later <- getTime
+  result2 <- publish feed feed.publisher result1.head later 50100.0
+  Some headView <- queryInterfaceContractId feed.reader result2.head
+  headView.roundNumber === 2
+  Some roundView <- queryInterfaceContractId feed.reader result2.round
+  roundView.roundNumber === 2
+  roundView.timestamp === later
+
+testOnlyTheOperatorRetiresARound : Script ()
+testOnlyTheOperatorRetiresARound = do
+  feed <- setup
+  (round1, _) <- publishTwo feed
+  submitMustFailWith (actAs feed.auditor1) "only the operator retires a round" $
+    exerciseCmd round1 Api.Round_Archive with actor = feed.auditor1
+
+-- Distribution --------------------------------------------------------------
+
+-- | Publish one round and let the licensee sublicense. Returns the root
+-- capsule view and the licensee's license.
+distributionFixture : Script (Feed, Api.CapsuleView, ContractId Api.License, Api.CreateRoundResult)
+distributionFixture = do
+  feed <- setup
+  now <- getTime
+  result <- publish feed feed.publisher feed.head now 50000.0
+  Some rootView <- queryInterfaceContractId feed.licensee result.capsule
+  sublicense <- submit feed.licensee $ exerciseCmd feed.rootLicense Api.License_CreateSublicense with
+    actor = feed.licensee, licenseType = AVText "redistribution", licensees = [feed.client1]
+  pure (feed, rootView, sublicense, result)
+
+testDistributeByView : Script ()
+testDistributeByView = do
+  (feed, rootView, sublicense, _) <- distributionFixture
+  capsule <- submit feed.licensee $ exerciseCmd sublicense Api.License_Distribute with
+    source = Api.ByView rootView
+    clients = [feed.client1, feed.client2]
+
+  Some v <- queryInterfaceContractId feed.client1 capsule
+  v.roundNumber === rootView.roundNumber
+  v.content.license === sublicense
+  v.content.dataPoint.distributor === feed.licensee
+  v.content.dataPoint.values === rootView.content.dataPoint.values
+  v.content.payload === rootView.content.payload
+
+  -- The Data Standard view is the same data point. `Capsule` requires
+  -- `PublishedDataPoint`, so the contract id converts between the two.
+  Some dp <- queryInterfaceContractId feed.client2 (toInterfaceContractId @PublishedDataPoint capsule)
+  dp === v.content.dataPoint
+  pure ()
+
+testDistributeById : Script ()
+testDistributeById = do
+  (feed, _, sublicense, result) <- distributionFixture
+  -- The licensee is an observer of the root capsule, so it may fetch it.
+  capsule <- submit feed.licensee $ exerciseCmd sublicense Api.License_Distribute with
+    source = Api.ById result.capsule
+    clients = [feed.client1]
+  Some v <- queryInterfaceContractId feed.client1 capsule
+  v.content.dataPoint.distributor === feed.licensee
+  pure ()
+
+testDistributedCapsuleServesItsDataPoint : Script ()
+testDistributedCapsuleServesItsDataPoint = do
+  (feed, rootView, sublicense, _) <- distributionFixture
+  capsule <- submit feed.licensee $ exerciseCmd sublicense Api.License_Distribute with
+    source = Api.ByView rootView, clients = [feed.client1]
+  Some capsuleView <- queryInterfaceContractId feed.client1 capsule
+  -- The Data Standard's own read path, for a consumer written against it
+  -- alone. The exercise informs the capsule's signatory, the distributor,
+  -- so a CAPS consumer reads the view from its own participant instead, as
+  -- the line above does.
+  fetched <- submit feed.client1 $
+    exerciseCmd (toInterfaceContractId @PublishedDataPoint capsule) PublishedDataPoint_Fetch with
+      actor = feed.client1
+  fetched === capsuleView.content.dataPoint
+
+testConsumerVerifiesDistributedCapsule : Script ()
+testConsumerVerifiesDistributedCapsule = do
+  (feed, rootView, sublicense, result) <- distributionFixture
+  capsule <- submit feed.licensee $ exerciseCmd sublicense Api.License_Distribute with
+    source = Api.ByView rootView, clients = [feed.client1]
+  Some capsuleView <- queryInterfaceContractId feed.client1 capsule
+  -- The client reads the round through the readers party and verifies
+  -- against a verifier instance of its own.
+  Some roundView <- queryInterfaceContractId feed.reader result.round
+  ownVerifierCid <- submit feed.client1 $ createCmd TestVerifier with
+    owner = feed.client1, acceptedTag = nodesTag, observers = []
+    maxBehind = hours 1, maxAhead = minutes 5
+  let ownVerifier = toInterfaceContractId @Api.Verifier ownVerifierCid
+  verified <- submit feed.client1 $ exerciseCmd ownVerifier Api.Verifier_Verify with
+    actor = feed.client1, capsule = capsuleView
+  verified === Api.Verified roundView.dataHash
+  canonical <- submit feed.client1 $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+    actor = feed.client1, capsule = capsuleView, round = roundView
+  canonical === Api.Passed
+  -- A capsule claiming another round is reported, not aborted on.
+  let lying = capsuleView with roundNumber = 7
+  rejected <- submit feed.client1 $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+    actor = feed.client1, capsule = lying, round = roundView
+  rejected === Api.Failed ["round number mismatch"]
+  -- Freshness is judged against a reference time the consumer chooses.
+  now <- getTime
+  fresh <- submit feed.client1 $ exerciseCmd ownVerifier Api.Verifier_VerifyFreshness with
+    actor = feed.client1, capsule = capsuleView, asOf = now
+  fresh === Api.Passed
+  stale <- submit feed.client1 $ exerciseCmd ownVerifier Api.Verifier_VerifyFreshness with
+    actor = feed.client1, capsule = capsuleView, asOf = addRelTime now (days 1)
+  stale === Api.Failed ["fixing time too far in the past"]
+
+testDistributionIsInvisibleToOperatorAndAuditors : Script ()
+testDistributionIsInvisibleToOperatorAndAuditors = do
+  (feed, rootView, sublicense, result) <- distributionFixture
+  capsule <- submit feed.licensee $ exerciseCmd sublicense Api.License_Distribute with
+    source = Api.ByView rootView, clients = [feed.client1, feed.client2]
+
+  -- Neither the operator nor the auditors see the distributed capsule, as a
+  -- contract or through either interface.
+  None <- queryInterfaceContractId feed.operator capsule
+  None <- queryInterfaceContractId feed.auditor1 capsule
+  None <- queryInterfaceContractId feed.auditor2 capsule
+  operatorCapsules <- query @Capsule feed.operator
+  map (\(cid, _) -> toInterfaceContractId @Api.Capsule cid) operatorCapsules === [result.capsule]
+  auditorCapsules <- query @Capsule feed.auditor1
+  map (\(cid, _) -> toInterfaceContractId @Api.Capsule cid) auditorCapsules === [result.capsule]
+
+  -- The operator does see that the sublicense exists, and who owns it.
+  Some sub <- queryInterfaceContractId feed.operator sublicense
+  sub.owner === feed.licensee
+
+  -- Clients of one capsule see each other.
+  [(_, c)] <- query @Capsule feed.client1
+  sort c.observers === sort [feed.client1, feed.client2]
+  pure ()
+
+testSublicenseRequiresEntitlement : Script ()
+testSublicenseRequiresEntitlement = do
+  feed <- setup
+  -- Shown the root license, a stranger still cannot sublicense from it.
+  Some licenseDisc <- queryDisclosure feed.operator (fromInterfaceContractId @License feed.rootLicense)
+  submitMustFailWith (actAs feed.stranger <> disclose licenseDisc) "actor is not a licensee of this license" $
+    exerciseCmd feed.rootLicense Api.License_CreateSublicense with
+      actor = feed.stranger, licenseType = AVText "x", licensees = []
+
+testSublicenseRequiresOwnerEntitlement : Script ()
+testSublicenseRequiresOwnerEntitlement = do
+  feed <- setup
+  submitMustFailWith (actAs feed.operator) "actor is not a licensee of this license" $
+    exerciseCmd feed.rootLicense Api.License_CreateSublicense with
+      actor = feed.operator, licenseType = AVText "x", licensees = []
+
+testSublicenseInheritsTerms : Script ()
+testSublicenseInheritsTerms = do
+  (feed, _, sublicense, _) <- distributionFixture
+  Some sublicenseContract <- queryContractId feed.licensee (fromInterfaceContractId @License sublicense)
+  -- The parent's terms the child inherits: its owner as licensor, the
+  -- operator, the expiry and the delegate; the rest is the child's own.
+  sublicenseContract.licensor === feed.operator
+  sublicenseContract.operator === feed.operator
+  sublicenseContract.validUntil === None
+  sublicenseContract.delegate === None
+  sublicenseContract.owner === feed.licensee
+  sublicenseContract.licensees === [feed.client1]
+
+testSublicenseChainContinues : Script ()
+testSublicenseChainContinues = do
+  (feed, rootView, sublicense, _) <- distributionFixture
+  -- The licensee named client1 as entitled to sublicense; client1 creates a
+  -- second-level license and distributes under it to client2. The operator
+  -- observes the second-level license too.
+  Some sub <- queryInterfaceContractId feed.client1 sublicense
+  sub.licensees === [feed.client1]
+  subsublicense <- submit feed.client1 $ exerciseCmd sublicense Api.License_CreateSublicense with
+    actor = feed.client1, licenseType = AVText "redistribution", licensees = []
+  Some _ <- queryInterfaceContractId feed.operator subsublicense
+  -- client1 holds a capsule distributed under the first-level license and
+  -- redistributes it under its own.
+  firstLevel <- submit feed.licensee $ exerciseCmd sublicense Api.License_Distribute with
+    source = Api.ByView rootView, clients = [feed.client1]
+  Some firstLevelView <- queryInterfaceContractId feed.client1 firstLevel
+  secondLevel <- submit feed.client1 $ exerciseCmd subsublicense Api.License_Distribute with
+    source = Api.ByView firstLevelView, clients = [feed.client2]
+  Some v <- queryInterfaceContractId feed.client2 secondLevel
+  v.content.license === subsublicense
+  v.content.dataPoint.distributor === feed.client1
+  -- client2 was not entitled to sublicense from the second-level license,
+  -- even when shown it.
+  Some subDisc <- queryDisclosure feed.client1 (fromInterfaceContractId @License subsublicense)
+  submitMustFailWith (actAs feed.client2 <> disclose subDisc) "actor is not a licensee of this license" $
+    exerciseCmd subsublicense Api.License_CreateSublicense with
+      actor = feed.client2, licenseType = AVText "x", licensees = []
+
+testOnlyOwnerDistributes : Script ()
+testOnlyOwnerDistributes = do
+  (feed, rootView, sublicense, _) <- distributionFixture
+  submitMustFail feed.client1 $ exerciseCmd sublicense Api.License_Distribute with
+    source = Api.ByView rootView, clients = [feed.client1]
+  -- The root license is owned by the operator; the licensee cannot
+  -- distribute under it directly.
+  submitMustFail feed.licensee $ exerciseCmd feed.rootLicense Api.License_Distribute with
+    source = Api.ByView rootView, clients = [feed.client1]
+
+testLicenseRejectsCapsuleOfAnotherDefinition : Script ()
+testLicenseRejectsCapsuleOfAnotherDefinition = do
+  (feed, rootView, _, _) <- distributionFixture
+  (otherDefinition, _) <- bootstrapDefinition feed "ETH/USD" None
+  otherRootLicense <- createRootLicense feed.operator [feed.licensee, feed.publisher] otherDefinition
+  otherSublicense <- submit feed.licensee $
+    exerciseCmd otherRootLicense Api.License_CreateSublicense with
+      actor = feed.licensee, licenseType = AVText "redistribution", licensees = []
+  submitMustFailWith (actAs feed.licensee) "capsule belongs to another definition" $
+    exerciseCmd otherSublicense Api.License_Distribute with
+      source = Api.ByView rootView, clients = [feed.client1]
+
+testRevokedLicenseCannotDistribute : Script ()
+testRevokedLicenseCannotDistribute = do
+  (feed, rootView, sublicense, _) <- distributionFixture
+  let subCid = fromInterfaceContractId @License sublicense
+  -- A client cannot revoke; the operator can, as observer.
+  submitMustFailWith (actAs feed.client1) "only the licensor or the operator may revoke" $
+    exerciseCmd subCid License_Revoke with revoker = feed.client1
+  submit feed.operator $ exerciseCmd subCid License_Revoke with revoker = feed.operator
+  submitMustFail feed.licensee $ exerciseCmd sublicense Api.License_Distribute with
+    source = Api.ByView rootView, clients = [feed.client1]

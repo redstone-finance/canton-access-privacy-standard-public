@@ -1,0 +1,91 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | The reference data definition and its bootstrap.
+--
+-- A definition is co-signed by the operator and the auditors, so creating
+-- one is a multi-party workflow: the operator proposes, each auditor accepts,
+-- and the operator finalizes. Finalization creates, in one transaction, the
+-- definition, its genesis round and the first round head, so no partial
+-- bootstrap can exist.
+module Caps.Core.DataDefinition where
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.Core.Round (Round(..))
+import Caps.Core.RoundHead (RoundHead(..))
+
+template DataDefinition
+  with
+    dataId : Text
+    operator : Party
+    auditors : [Party]
+      -- ^ Co-signatories: the operator cannot archive the definition alone.
+    readers : [Party]
+    verifier : ContractId Api.Verifier
+  where
+    signatory operator, auditors
+    observer readers
+
+    interface instance Api.DataDefinition for DataDefinition where
+      view = Api.DataDefinitionView with dataId, verifier
+
+-- | The bootstrap workflow. Signed by the operator and by every auditor who
+-- has accepted; `accepted` grows by one per acceptance until it covers
+-- `auditors`, at which point the operator may finalize.
+template DefinitionProposal
+  with
+    dataId : Text
+    operator : Party
+    auditors : [Party]
+    readers : [Party]
+    verifier : ContractId Api.Verifier
+    publishers : Optional [Party]
+    accepted : [Party]
+  where
+    signatory operator, accepted
+    observer auditors
+
+    choice DefinitionProposal_Accept : ContractId DefinitionProposal
+      with
+        auditor : Party
+      controller auditor
+      do assertMsg "not an auditor" $ auditor `elem` auditors
+         assertMsg "already accepted" $ auditor `notElem` accepted
+         create this with accepted = auditor :: accepted
+
+    -- | Abandon the proposal. The operator alone cannot archive it once an
+    -- auditor has accepted, since the acceptors are signatories; this
+    -- choice carries their authority from the contract.
+    choice DefinitionProposal_Cancel : ()
+      controller operator
+      do pure ()
+
+    -- | Create the definition, the genesis round (number 0, bootstrap time,
+    -- no data) and the first head pointing at it.
+    choice DefinitionProposal_Finalize : (ContractId DataDefinition, ContractId RoundHead)
+      controller operator
+      do assertMsg "not all auditors have accepted" $ all (`elem` accepted) auditors
+         now <- getTime
+         definitionCid <- create DataDefinition with
+           dataId, operator, auditors, readers, verifier
+         let definition = toInterfaceContractId @Api.DataDefinition definitionCid
+         genesis <- create Round with
+           definition
+           roundNumber = 0
+           timestamp = now
+           dataHash = ""
+           operator
+           auditors
+           readers
+         headCid <- create RoundHead with
+           definition
+           round = toInterfaceContractId genesis
+           roundNumber = 0
+           timestamp = now
+           isPaused = False
+           operator
+           auditors
+           readers
+           verifier
+           publishers
+         pure (definitionCid, headCid)

@@ -1,0 +1,84 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | The reference license. One template for every level of the chain: the
+-- root license is owned by the operator and created directly; every
+-- sublicense is created through `License_CreateSublicense` by the party that
+-- will own it, so that it is signed by that party alone.
+--
+-- Provenance is policed by observation: the operator is an observer of every
+-- license at every level. A license created outside `License_CreateSublicense`
+-- is visible to the operator the moment it exists and revocable through
+-- `License_Revoke`; whether a parent's choice created it is known to the
+-- licensor it names, as the parent's signatory, not to an observer.
+module Caps.Core.License where
+
+import DA.Optional (whenSome)
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.Core.Distribution (distribute, sublicenseDelegate)
+import DataStandard.Utils (AnyValue)
+
+template License
+  with
+    definition : ContractId Api.DataDefinition
+    owner : Party
+      -- ^ Signatory; the only party that may distribute under this license.
+    licensor : Party
+      -- ^ The owner of the parent license, or the operator for the root.
+      -- May revoke this license.
+    operator : Party
+      -- ^ The publishing party, observer at every level of the chain.
+    licensees : [Party]
+      -- ^ Parties entitled to create a sublicense from this one. They are
+      -- observers, so they can see the license they sublicense from. Fixed
+      -- for the life of the contract: to change the list, the owner creates
+      -- a new license (a sublicense from the same parent, or a new root)
+      -- and retires this one. Sublicenses refer to their licensor by party,
+      -- not by contract id, so they are unaffected.
+    licenseType : AnyValue
+      -- ^ The kind of right granted; opaque to the reference implementation.
+    validUntil : Optional Time
+      -- ^ Expiry; None for open-ended. Inherited by sublicenses.
+    delegate : Optional (ContractId Api.LicenseDelegate)
+      -- ^ Told of every distribution; gives every sublicense its delegate.
+  where
+    signatory owner
+    observer operator, licensor, licensees
+
+    interface instance Api.License for License where
+      view = Api.LicenseView with definition, owner, licensees, delegate
+
+      license_distributeImpl self arg = do
+        assertNotExpired validUntil
+        distribute self None definition owner delegate None arg
+
+      license_createSublicenseImpl _self arg = do
+        assertNotExpired validUntil
+        assertMsg "actor is not a licensee of this license" $
+          arg.actor `elem` licensees
+        childDelegate <- sublicenseDelegate owner delegate arg
+        toInterfaceContractId <$> create License with
+          definition
+          owner = arg.actor
+          licensor = owner
+          operator
+          licensees = arg.licensees
+          licenseType = arg.licenseType
+          validUntil
+          delegate = childDelegate
+
+    -- | Archive this license. Available to the licensor and to the operator,
+    -- neither of which is a signatory: the choice is what gives them the
+    -- right.
+    choice License_Revoke : ()
+      with
+        revoker : Party
+      controller revoker
+      do assertMsg "only the licensor or the operator may revoke" $
+           revoker == licensor || revoker == operator
+
+assertNotExpired : Optional Time -> Update ()
+assertNotExpired validUntil = do
+  now <- getTime
+  whenSome validUntil $ \t -> assertMsg "license expired" $ now <= t

@@ -1,0 +1,55 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Retention for root capsules. Every publication leaves a capsule behind,
+-- and nothing in the standard archives it; a consumer that has read one may
+-- still be using it. The archiver keeps the capsules of the newest rounds
+-- and, past them, each capsule until a keep period after its publication,
+-- the retention a RedStone price pill follows.
+module Caps.CapsuleArchiver where
+
+import DA.Foldable (forA_)
+import DA.Time (RelTime)
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.CapsuleArchiver.Internal.Retention (staleCapsules)
+
+-- | One distributor's archiver for one data definition. It carries the
+-- distributor's authority, so it can archive that distributor's capsules for
+-- any actor that sees it, the capsules and the round head, through the
+-- `Api.RoundHead` and `Api.Capsule` interfaces alone; a capsule of another
+-- distributor fails the archive for want of that distributor's authority.
+template CapsuleArchiver
+  with
+    distributor : Party
+    definition : ContractId Api.DataDefinition
+      -- ^ The data definition whose capsules this archiver retires.
+    keptRounds : Int
+      -- ^ How many of the newest rounds keep their capsules regardless of age.
+    keepPeriod : RelTime
+      -- ^ How long after its publication an older capsule stays.
+  where
+    signatory distributor
+
+    -- | Archive the capsules of `capsules` that are at least `keptRounds`
+    -- rounds behind the latest round of `roundHead` and were published more
+    -- than `keepPeriod` ago, and return them. Fails when the head or any of
+    -- the capsules belongs to another definition.
+    nonconsuming choice CapsuleArchiver_Archive : [ContractId Api.Capsule]
+      with
+        actor : Party
+        roundHead : ContractId Api.RoundHead
+          -- ^ The definition's round head; its `roundNumber` is the current
+          -- round's.
+        capsules : [ContractId Api.Capsule]
+      controller actor
+      do
+        headView <- view <$> fetch roundHead
+        assertMsg "round head belongs to another definition" $ headView.definition == definition
+        views <- forA capsules (fmap view . fetch)
+        forA_ views \capsule ->
+          assertMsg "capsule belongs to another definition" $ capsule.definition == definition
+        stale <- map fst <$> staleCapsules keptRounds keepPeriod headView.roundNumber (zip capsules views)
+        forA_ stale archive
+
+        pure stale

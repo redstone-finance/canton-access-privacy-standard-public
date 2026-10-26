@@ -1,0 +1,139 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | The reference round head: the publishing endpoint and mutex of a data
+-- definition. Generic over the oracle: every vendor-specific check goes
+-- through the definition's canonical `Verifier`.
+--
+-- A publication touches three existing contracts: the head it consumes, the
+-- verifier and the root license. Every contract used in a transaction must
+-- be visible to the submitter's participant, so publishing is open to
+-- whoever sees all three: the operator and the root license's licensees by
+-- observation (provided the verifier's template makes the readers
+-- observers), anyone else by explicit disclosure. The root license is read
+-- through its interface only, so any License implementation can serve as
+-- the root license. The head carries the latest round's number and fixing
+-- time itself, so no round is fetched: retiring any round, the latest
+-- included, never stops publication.
+module Caps.Core.RoundHead where
+
+import DA.Optional (whenSome)
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.Core.Capsule (Capsule(..))
+import Caps.Core.Round (Round(..))
+
+template RoundHead
+  with
+    definition : ContractId Api.DataDefinition
+    round : ContractId Api.Round
+      -- ^ The latest round; the genesis round right after bootstrap. A
+      -- pointer only: publication does not fetch it.
+    roundNumber : Int
+      -- ^ The latest round's number.
+    timestamp : Time
+      -- ^ The latest round's fixing time; the bootstrap time for genesis.
+    isPaused : Bool
+    operator : Party
+    auditors : [Party]
+      -- ^ Co-signatories. Their authority flows into every successor head
+      -- through this choice, so they act only at bootstrap; the operator
+      -- alone cannot archive the head or mint a parallel chain.
+    readers : [Party]
+    verifier : ContractId Api.Verifier
+      -- ^ The definition's canonical verifier, exercised on every round. Its
+      -- template MUST make the readers observers, or publishers cannot use it.
+    publishers : Optional [Party]
+      -- ^ Parties admitted to publish besides the operator, who always is.
+      -- None means anyone; Some [] means the operator only.
+  where
+    signatory operator, auditors
+    observer readers
+
+    interface instance Api.RoundHead for RoundHead where
+      view = Api.RoundHeadView with definition, round, roundNumber, isPaused
+
+      roundHead_createRoundImpl _self arg = do
+        assertMsg "publication is paused" $ not isPaused
+        whenSome publishers $ \admitted ->
+          assertMsg "publisher not admitted" $
+            arg.actor == operator || arg.actor `elem` admitted
+
+        let fixingTime = arg.content.dataPoint.publishedAt
+        assertMsg "fixing time not after the previous round" $
+          fixingTime > timestamp
+        assertMsg "root capsule must be distributed by the operator" $
+          arg.content.dataPoint.distributor == operator
+        -- The root license: this definition's, owned by the operator. Its
+        -- licensees are the root capsule's audience. Read through the
+        -- interface, so any License implementation can be the root license.
+        license <- view <$> fetch arg.content.license
+        assertMsg "license belongs to another definition" $
+          license.definition == definition
+        assertMsg "root license must be owned by the operator" $
+          license.owner == operator
+
+        let newNumber = roundNumber + 1
+            capsuleView = Api.CapsuleView with
+              definition
+              roundNumber = newNumber
+              content = arg.content
+        verification <- exercise verifier Api.Verifier_Verify with
+          actor = arg.actor
+          capsule = capsuleView
+        dataHash <- case verification of
+          Api.Verified dataHash -> pure dataHash
+          Api.Rejected reasons ->
+            abort $ "the verifier rejected the content: " <> show reasons
+        -- The acceptance window around ledger time is the oracle's: a
+        -- future-dated round would block every later one until the clock
+        -- caught up, a stale one would be recorded as the latest fixing.
+        now <- getTime
+        freshness <- exercise verifier Api.Verifier_VerifyFreshness with
+          actor = arg.actor
+          capsule = capsuleView
+          asOf = now
+        case freshness of
+          Api.Passed -> pure ()
+          Api.Failed reasons ->
+            abort $ "the verifier rejected the fixing time: " <> show reasons
+
+        newRound <- create Round with
+          definition
+          roundNumber = newNumber
+          timestamp = fixingTime
+          dataHash
+          operator
+          auditors
+          readers
+        newHead <- create this with
+          round = toInterfaceContractId newRound
+          roundNumber = newNumber
+          timestamp = fixingTime
+        capsule <- create Capsule with
+          definition
+          roundNumber = newNumber
+          content = arg.content
+          distributor = operator
+          observers = license.licensees ++ auditors
+        pure Api.CreateRoundResult with
+          head = toInterfaceContractId newHead
+          round = toInterfaceContractId newRound
+          capsule = toInterfaceContractId capsule
+
+    -- | Suspend publication. Any single auditor may pause; a stricter
+    -- m-of-n policy is a matter of a proposal workflow around this choice.
+    choice RoundHead_Pause : ContractId RoundHead
+      with
+        auditor : Party
+      controller auditor
+      do assertMsg "not an auditor" $ auditor `elem` auditors
+         create this with isPaused = True
+
+    -- | Resume publication.
+    choice RoundHead_Resume : ContractId RoundHead
+      with
+        auditor : Party
+      controller auditor
+      do assertMsg "not an auditor" $ auditor `elem` auditors
+         create this with isPaused = False

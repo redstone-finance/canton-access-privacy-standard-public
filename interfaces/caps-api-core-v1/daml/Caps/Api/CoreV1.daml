@@ -1,0 +1,433 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | CAPS v1: the core interfaces of the Canton Access and Privacy Standard.
+--
+-- A data set is published in rounds. Each round is a canonical fixing,
+-- recorded price-free on-ledger and visible to the feed's readers, and a root
+-- capsule that carries the data. Licensees redistribute the data by
+-- distributing capsules scoped to their own clients; the publisher of the
+-- rounds is a stakeholder of none of them. A consumer proves what it received
+-- by two local checks: authenticity, against a verifier it instantiated
+-- itself, and canonicality, against the round it read from its own
+-- participant.
+--
+-- This package holds views, data types and choices whose bodies are single
+-- method calls. A package that defines an interface can never be
+-- smart-contract-upgraded, so no logic lives here: it belongs to the
+-- implementing templates or to the standard's utility package.
+--
+-- Two rules shape every signature below. First, verification takes views,
+-- never contract ids, because a fetch informs the fetched contract's
+-- signatories and would reveal consumption; distribution offers the view as
+-- the private option. Second, the only vendor-specific contract is the
+-- Verifier: the data path is generic, and an oracle joins the standard by
+-- implementing that one interface.
+module Caps.Api.CoreV1 where
+
+import DataStandard.DataPointV1 (PublishedDataPoint, PublishedDataPointView)
+import DataStandard.Utils (AnyValue)
+
+-- ---------------------------------------------------------------------------
+-- CapsuleContent
+-- ---------------------------------------------------------------------------
+
+-- | What a capsule carries beyond its round. Shared by `RoundHead_CreateRound`,
+-- where it describes the root capsule, and by `CapsuleView`.
+data CapsuleContent = CapsuleContent with
+    dataPoint : PublishedDataPointView
+      -- ^ The aggregated data point. Its `publishedAt` is the fixing time and
+      -- its `distributor` the capsule's signatory.
+    payload : AnyValue
+      -- ^ The signed oracle data the aggregate was computed from, in the
+      -- oracle's own encoding. Opaque to the standard. Carried so that a
+      -- capsule can be verified on its own and redistributed through
+      -- `License_Distribute`.
+    license : ContractId License
+      -- ^ The license this capsule is distributed under: the root license for
+      -- a root capsule, the distributor's license otherwise. A consumer
+      -- checks that the license's `owner` is the capsule's distributor.
+  deriving (Eq, Show, Serializable)
+
+-- ---------------------------------------------------------------------------
+-- DataDefinition
+-- ---------------------------------------------------------------------------
+
+-- | The data set's identity and trust anchor. Its contract id is what every
+-- round, capsule and license points to; a consumer pins it once at
+-- onboarding.
+interface DataDefinition where
+  viewtype DataDefinitionView
+
+-- | View for `DataDefinition`.
+data DataDefinitionView = DataDefinitionView with
+    dataId : Text
+      -- ^ Human-readable identifier of the data set ("BTC/USD", a basket id,
+      -- a NAV series). Not unique by itself; the definition's contract id is.
+    verifier : ContractId Verifier
+      -- ^ The canonical verifier instance, identifying the template and
+      -- parameters consumers verify against. See `Verifier`.
+  deriving (Eq, Show, Serializable)
+
+-- ---------------------------------------------------------------------------
+-- Verifier
+-- ---------------------------------------------------------------------------
+
+-- | Why a check failed, in the implementation's words.
+type RejectionReason = Text
+
+-- | The outcome of `Verifier_Verify`. A verify never aborts on a bad
+-- capsule: it reports, so that a caller can branch on the outcome, for
+-- instance to fall back to another feed or to record a rejection. A caller
+-- that needs the transaction to fail asserts on the result.
+data VerificationResult
+  = Verified with
+      dataHash : Text
+        -- ^ The verifier's commitment to the capsule's content.
+  | Rejected [RejectionReason]
+    -- ^ Every check that failed.
+  deriving (Eq, Show, Serializable)
+
+-- | The outcome of a check that yields nothing beyond its verdict:
+-- `Verifier_VerifyRound` and `Verifier_VerifyFreshness`. Reported, never
+-- aborted on, like `VerificationResult`.
+data CheckResult
+  = Passed
+  | Failed [RejectionReason]
+    -- ^ Every check that failed.
+  deriving (Eq, Show, Serializable)
+
+-- | The oracle's verification rules as a contract, and the only
+-- vendor-specific piece of a CAPS deployment. A consumer never exercises the
+-- canonical instance a definition points to, because that would inform its
+-- signatory; it creates an instance of its own from the same template, with
+-- itself as signatory, so a verify has no informee other than the verifying
+-- party.
+interface Verifier where
+  viewtype VerifierView
+
+  verifier_verifyImpl : ContractId Verifier -> Verifier_Verify
+    -> Update VerificationResult
+  verifier_verifyRoundImpl : ContractId Verifier -> Verifier_VerifyRound
+    -> Update CheckResult
+  verifier_verifyFreshnessImpl : ContractId Verifier -> Verifier_VerifyFreshness
+    -> Update CheckResult
+
+  -- | Authenticity: `Verified`, carrying the commitment to the content,
+  -- when `capsule.content` is authentic by this verifier's rules; `Rejected`
+  -- with the reasons otherwise. What the rules are is the implementation's;
+  -- typically they require that `payload` carries a sufficient set of valid
+  -- oracle signatures and that `dataPoint` is the correct aggregate of it.
+  -- Re-executed by every informee's participant when used in a settlement.
+  nonconsuming choice Verifier_Verify : VerificationResult
+    with
+      actor : Party
+        -- ^ The verifying party; sole controller.
+      capsule : CapsuleView
+        -- ^ The capsule being checked, passed as data so that no fetch
+        -- reaches its distributor.
+    controller actor
+    do verifier_verifyImpl this self arg
+
+  -- | Canonicality: `Passed` when `round` belongs to `capsule.definition`,
+  -- has `capsule.roundNumber`, its `timestamp` is the capsule's fixing time,
+  -- and its `dataHash` is this verifier's commitment to `capsule.content`;
+  -- `Failed` with the reasons otherwise. Checks the round against the
+  -- content only; authenticity of the content is `Verifier_Verify`.
+  nonconsuming choice Verifier_VerifyRound : CheckResult
+    with
+      actor : Party
+        -- ^ The verifying party; sole controller.
+      capsule : CapsuleView
+        -- ^ The capsule being checked.
+      round : RoundView
+        -- ^ The round as read from the consumer's own participant.
+    controller actor
+    do verifier_verifyRoundImpl this self arg
+
+  -- | Freshness: `Passed` when the capsule's fixing time is acceptable at
+  -- `asOf` by this verifier's window; `Failed` with the reasons otherwise.
+  -- The window is the oracle's: how far behind `asOf` a fixing may be and
+  -- still become the latest round, and how far ahead. A round head passes
+  -- ledger time at publication and refuses the round on `Failed`. A
+  -- consumer passes the time it cares about, or applies its own policy to
+  -- `content.dataPoint.publishedAt` instead; the verdict is a function of
+  -- the capsule and `asOf` only, so it can be reproduced later.
+  nonconsuming choice Verifier_VerifyFreshness : CheckResult
+    with
+      actor : Party
+        -- ^ The verifying party; sole controller.
+      capsule : CapsuleView
+        -- ^ The capsule being checked.
+      asOf : Time
+        -- ^ The reference time the fixing time is judged against.
+    controller actor
+    do verifier_verifyFreshnessImpl this self arg
+
+-- | View for `Verifier`. Empty: the parameters are template fields, known to
+-- whoever creates an instance.
+data VerifierView = VerifierView {}
+  deriving (Eq, Show, Serializable)
+
+-- ---------------------------------------------------------------------------
+-- RoundHead
+-- ---------------------------------------------------------------------------
+
+-- | The head of a data definition's round chain and its publishing endpoint.
+-- One live contract per definition, consumed and re-created on every round,
+-- which is what makes round numbering unique: two concurrent publications
+-- are a double spend of the head, and the losing one creates nothing. Pausing
+-- is governance and has no standard choice.
+interface RoundHead where
+  viewtype RoundHeadView
+
+  -- | Implementation of `RoundHead_CreateRound`. Receives the head's own
+  -- contract id, which interface method bodies cannot otherwise name.
+  roundHead_createRoundImpl : ContractId RoundHead -> RoundHead_CreateRound
+    -> Update CreateRoundResult
+
+  -- | Publish a new round. Open to any actor the implementation admits: the
+  -- authority to sign the round and the root capsule flows from this
+  -- contract, not from the caller. Checks `content` through the definition's
+  -- canonical verifier, which also yields the round commitment, then
+  -- atomically archives this head, creates the
+  -- round, the successor head pointing at it, and the root capsule. Fails
+  -- when the verifier rejects the content, when the fixing time is not
+  -- strictly greater than the previous round's, or while paused. The
+  -- implementation MUST also refuse a fixing time the verifier's
+  -- `Verifier_VerifyFreshness` fails at ledger time: a future-dated round
+  -- would block every later one until the clock caught up, and a stale one
+  -- would be recorded as the latest fixing.
+  choice RoundHead_CreateRound : CreateRoundResult
+    with
+      actor : Party
+        -- ^ The publisher; sole controller.
+      content : CapsuleContent
+        -- ^ The root capsule's content: the aggregate computed by the
+        -- publisher, the payload it came from, and the root license in force
+        -- for this round. A different license may be attached each round.
+    controller actor
+    do roundHead_createRoundImpl this self arg
+
+-- | View for `RoundHead`.
+data RoundHeadView = RoundHeadView with
+    definition : ContractId DataDefinition
+      -- ^ The data definition this head belongs to.
+    round : ContractId Round
+      -- ^ The latest round. A pointer, not a dependency: it may have been
+      -- retired under the deployment's retention.
+    roundNumber : Int
+      -- ^ The latest round's number; the next publication creates the
+      -- round after it.
+    isPaused : Bool
+      -- ^ True when publication is suspended by the feed's governance.
+  deriving (Eq, Show, Serializable)
+
+-- | Result of `RoundHead_CreateRound`.
+data CreateRoundResult = CreateRoundResult with
+    head : ContractId RoundHead
+      -- ^ The successor of the consumed head, pointing at `round`.
+    round : ContractId Round
+      -- ^ The new round.
+    capsule : ContractId Capsule
+      -- ^ The root capsule for the new round.
+  deriving (Eq, Show, Serializable)
+
+-- ---------------------------------------------------------------------------
+-- Round
+-- ---------------------------------------------------------------------------
+
+-- | The immutable, price-free record of one fixing, visible to the feed's
+-- readers party. A consumer reads it from its own participant and passes the
+-- view to `Verifier_VerifyRound`; it is never fetched inside a consumer's
+-- transaction.
+interface Round where
+  viewtype RoundView
+
+  -- | Implementation of `Round_Archive`. Receives the round's own contract
+  -- id, as every other method does.
+  round_archiveImpl : ContractId Round -> Round_Archive -> Update ()
+
+  -- | Retire this round. The authority to archive it flows from this
+  -- contract, not from the caller. The implementation MUST refuse any actor
+  -- it does not admit; when no capsule needs a round any more is an
+  -- archiver's rule.
+  choice Round_Archive : ()
+    with
+      actor : Party
+        -- ^ The party retiring the round; sole controller.
+    controller actor
+    do round_archiveImpl this self arg
+
+-- | View for `Round`.
+data RoundView = RoundView with
+    definition : ContractId DataDefinition
+      -- ^ The data definition this round belongs to.
+    roundNumber : Int
+      -- ^ Increases by one per round. Round 0 is the genesis round created
+      -- when the definition is bootstrapped; it carries no capsule and its
+      -- `timestamp` is the bootstrap time. Data rounds start at 1.
+    timestamp : Time
+      -- ^ The fixing time, strictly greater than the previous round's.
+    dataHash : Text
+      -- ^ A commitment to the capsule content, as returned by the
+      -- Verifier's `Verified` when the round was created. How it is
+      -- computed is the Verifier implementation's, not this standard's;
+      -- `Verifier_VerifyRound` recomputes and compares it.
+  deriving (Eq, Show, Serializable)
+
+-- ---------------------------------------------------------------------------
+-- License
+-- ---------------------------------------------------------------------------
+
+-- | How `License_Distribute` receives the capsule it redistributes.
+-- `ByView` passes the capsule as data: the exercise has no informee beyond
+-- the license owner and the new capsule's audience. `ById` makes the
+-- implementation fetch the capsule, which informs its signatory, the root
+-- publisher or the parent distributor, of the time of this distribution.
+data CapsuleSource
+  = ById (ContractId Capsule)
+  | ByView CapsuleView
+  deriving (Eq, Show, Serializable)
+
+-- | A right to distribute capsules and to sublicense. One interface for every
+-- level of the chain; the root license is owned by the party that publishes
+-- the data. How a licensor polices provenance and revokes licenses is the
+-- implementation's concern. A consumer checks that `owner` is the capsule's
+-- distributor and that `definition` is the capsule's. A license MAY name a
+-- `LicenseDelegate`, which it calls on every distribution and sublicense.
+interface License where
+  viewtype LicenseView
+
+  -- | Implementation of `License_Distribute`. Receives the license's own
+  -- contract id to set as the new capsule's `content.license`.
+  license_distributeImpl : ContractId License -> License_Distribute
+    -> Update (ContractId Capsule)
+  license_createSublicenseImpl : ContractId License -> License_CreateSublicense
+    -> Update (ContractId License)
+
+  -- | Create a capsule for `clients` carrying an existing capsule's content.
+  -- The implementation copies definition, round and content unchanged except
+  -- for `license` (this one) and `dataPoint.distributor` (the owner), and
+  -- asserts the audience against its terms, then reports to its delegate,
+  -- if any. Authenticity is the consumer's check through a Verifier.
+  nonconsuming choice License_Distribute : ContractId Capsule
+    with
+      source : CapsuleSource
+        -- ^ The capsule being redistributed, by view or by contract id. See
+        -- `CapsuleSource` for what each reveals.
+      clients : [Party]
+        -- ^ Observers of the new capsule. They see each other.
+    controller (view this).owner
+    do license_distributeImpl this self arg
+
+  -- | Create a child license owned by `actor`, who MUST be one of this
+  -- license's `licensees`. The actor is the controller because the child is
+  -- signed by them alone. The child names the delegate this license's
+  -- delegate returns, if any.
+  nonconsuming choice License_CreateSublicense : ContractId License
+    with
+      actor : Party
+        -- ^ Owner of the new license.
+      licenseType : AnyValue
+        -- ^ The kind of right granted, in the implementation's own encoding.
+      licensees : [Party]
+        -- ^ Parties the new license entitles to sublicense from it.
+    controller actor
+    do license_createSublicenseImpl this self arg
+
+-- | View for `License`.
+data LicenseView = LicenseView with
+    definition : ContractId DataDefinition
+      -- ^ The data definition this license covers.
+    owner : Party
+      -- ^ The signatory, and the only party that may distribute under it.
+    licensees : [Party]
+      -- ^ Parties entitled to sublicense from this license. On the root
+      -- license they are also the audience of every root capsule.
+    delegate : Optional (ContractId LicenseDelegate)
+      -- ^ The delegate this license calls.
+  deriving (Eq, Show, Serializable)
+
+-- ---------------------------------------------------------------------------
+-- LicenseDelegate
+-- ---------------------------------------------------------------------------
+
+-- | What a license does on a distribution beyond creating the capsule, such
+-- as accounting. Who signs a delegate is the implementation's; its
+-- signatories are informees, and confirmers, of every distribution that
+-- calls it.
+interface LicenseDelegate where
+  viewtype LicenseDelegateView
+
+  licenseDelegate_onDistributeImpl : ContractId LicenseDelegate -> LicenseDelegate_OnDistribute
+    -> Update ()
+  licenseDelegate_subdelegateImpl : ContractId LicenseDelegate -> LicenseDelegate_Subdelegate
+    -> Update (Optional (ContractId LicenseDelegate))
+
+  -- | Report a distribution. Exercised by `License_Distribute` in the same
+  -- transaction, after the capsule is created.
+  nonconsuming choice LicenseDelegate_OnDistribute : ()
+    with
+      distributor : Party
+        -- ^ The owner of the license; sole controller.
+      license : ContractId License
+        -- ^ The license as issued, also when its contract was replaced.
+      roundNumber : Int
+        -- ^ The round the distributed data was fixed in.
+      capsule : Optional (ContractId Capsule)
+        -- ^ The capsule the distribution created, if the license names it.
+      clients : Optional [Party]
+        -- ^ The parties the capsule was distributed to, if the license names
+        -- them.
+      context : Optional AnyValue
+        -- ^ Anything else the license tells its delegate, in the license's
+        -- own encoding.
+    controller distributor
+    do licenseDelegate_onDistributeImpl this self arg
+
+  -- | Give a sublicense its delegate: this one, a new one or none. Exercised
+  -- by `License_CreateSublicense` before the child license is created, with
+  -- the authority of both owners; the new owner submits, so must observe
+  -- this delegate.
+  nonconsuming choice LicenseDelegate_Subdelegate : Optional (ContractId LicenseDelegate)
+    with
+      licensor : Party
+        -- ^ Owner of the license being sublicensed; controls the choice
+        -- together with `actor`.
+      actor : Party
+        -- ^ Owner of the new license; controls the choice together with
+        -- `licensor`.
+      licenseType : AnyValue
+        -- ^ The kind of right the new license grants, in the implementation's
+        -- own encoding.
+      licensees : [Party]
+        -- ^ Licensees of the new license, who sublicense through its delegate.
+    controller licensor, actor
+    do licenseDelegate_subdelegateImpl this self arg
+
+-- | View for `LicenseDelegate`. Empty, like `VerifierView`.
+data LicenseDelegateView = LicenseDelegateView {}
+  deriving (Eq, Show, Serializable)
+
+-- ---------------------------------------------------------------------------
+-- Capsule
+-- ---------------------------------------------------------------------------
+
+-- | The unit of distribution. Requiring `PublishedDataPoint` means every
+-- capsule is readable by any Canton Data Standard consumer unchanged; this
+-- view adds provenance. No choices: authenticity and canonicality are checked
+-- through a Verifier.
+interface Capsule requires PublishedDataPoint where
+  viewtype CapsuleView
+
+-- | View for `Capsule`.
+data CapsuleView = CapsuleView with
+    definition : ContractId DataDefinition
+      -- ^ The data definition this capsule carries data for.
+    roundNumber : Int
+      -- ^ The round this data was fixed in.
+    content : CapsuleContent
+      -- ^ Data point, payload and license. `content.dataPoint` MUST equal the
+      -- view this contract exposes through `PublishedDataPoint`.
+  deriving (Eq, Show, Serializable)

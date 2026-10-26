@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="1140" viewBox="0 0 680 1140" role="img">
+<title>Who sees and who exercises along a license chain</title>
+<desc>The license chain L0 to Ln with the accounting delegates, the CreateSublicense and Distribute exercises, the capsules and the markers; each box lists the signatory, the observers and the controllers of its choices.</desc>
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; dominant-baseline: central; text-anchor: middle; }
+.th { font-size: 14px; font-weight: 500; }
+.ts { font-size: 12px; }
+rect { stroke-width: 0.5; }
+.license rect { fill: #AE0822; stroke: #950017; } .license .th { fill: #FFFFFF; } .license .ts { fill: #FFE3E3; }
+.capsule rect { fill: #FFE3E3; stroke: #E41939; } .capsule .th { fill: #3D0309; } .capsule .ts { fill: #AE0822; }
+.delegate rect { fill: #FFF6F6; stroke: #EBA4B0; } .delegate .th { fill: #3D0309; } .delegate .ts { fill: #6F6B6B; }
+.marker rect { fill: #F7F7F7; stroke: #E7E7E7; } .marker .th { fill: #6F6B6B; } .marker .ts { fill: #6F6B6B; }
+.ex rect { fill: none; stroke: #E41939; stroke-dasharray: 4 4; } .ex .th { fill: #AE0822; } .ex .ts { fill: #6F6B6B; }
+.dots { font-size: 14px; fill: #AE0822; }
+.legend { text-anchor: start; font-size: 12px; fill: #6F6B6B; }
+.arr { stroke: #AE0822; stroke-width: 1.5; fill: none; }
+</style>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#AE0822" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="0" y="0" width="680" height="1140" fill="#FFFFFF" stroke="none"/>
+
+<g class="delegate"><rect x="40" y="40" width="140" height="112" rx="8"/><text class="th" x="110" y="56">delegate L0</text><text class="ts" x="110" y="74">signatory: O</text><text class="ts" x="110" y="91">observers: D1, A</text><text class="ts" x="110" y="108">OnDistribute: O</text><text class="ts" x="110" y="125">Subdelegate:</text><text class="ts" x="110" y="142">O with D1</text></g>
+<g class="license"><rect x="196" y="40" width="150" height="112" rx="8"/><text class="th" x="271" y="56">L0: license</text><text class="ts" x="271" y="74">signatory: O</text><text class="ts" x="271" y="91">observers: D1</text><text class="ts" x="271" y="108">Distribute: O</text><text class="ts" x="271" y="125">CreateSublicense: D1</text><text class="ts" x="271" y="142">Revoke: O</text></g>
+<g class="ex"><rect x="362" y="40" width="110" height="80" rx="8"/><text class="th" x="417" y="56">CreateRound</text><text class="ts" x="417" y="75">by O</text><text class="ts" x="417" y="92">informees: O,</text><text class="ts" x="417" y="109">auditors</text></g>
+<g class="capsule"><rect x="488" y="40" width="150" height="112" rx="8"/><text class="th" x="563" y="56">C0: capsule</text><text class="ts" x="563" y="75">signatory: O</text><text class="ts" x="563" y="92">observers: D1,</text><text class="ts" x="563" y="109">auditors</text><text class="ts" x="563" y="126">Fetch: any viewer</text><text class="ts" x="563" y="143">Archive: O</text></g>
+<line x1="474" y1="72" x2="485" y2="72" class="arr" marker-end="url(#arrow)"/>
+<g class="ex"><rect x="196" y="172" width="150" height="64" rx="8"/><text class="th" x="271" y="188">CreateSublicense</text><text class="ts" x="271" y="207">on L0, by D1</text><text class="ts" x="271" y="224">informees: O, D1</text></g>
+<line x1="271" y1="154" x2="271" y2="169" class="arr" marker-end="url(#arrow)"/>
+<line x1="271" y1="238" x2="271" y2="253" class="arr" marker-end="url(#arrow)"/>
+<path d="M196 204 L110 204 L110 253" class="arr" marker-end="url(#arrow)"/>
+
+<g class="delegate"><rect x="40" y="256" width="140" height="112" rx="8"/><text class="th" x="110" y="272">delegate L1</text><text class="ts" x="110" y="290">signatory: D1</text><text class="ts" x="110" y="307">observers: D2, A</text><text class="ts" x="110" y="324">OnDistribute: D1</text><text class="ts" x="110" y="341">Subdelegate:</text><text class="ts" x="110" y="358">D1 with D2</text></g>
+<g class="license"><rect x="196" y="256" width="150" height="112" rx="8"/><text class="th" x="271" y="272">L1: license</text><text class="ts" x="271" y="290">signatory: D1</text><text class="ts" x="271" y="307">observers: O, D2</text><text class="ts" x="271" y="324">Distribute: D1</text><text class="ts" x="271" y="341">CreateSublicense: D2</text><text class="ts" x="271" y="358">Revoke: O</text></g>
+<g class="ex"><rect x="362" y="256" width="110" height="64" rx="8"/><text class="th" x="417" y="272">Distribute</text><text class="ts" x="417" y="291">on L1, by D1</text><text class="ts" x="417" y="308">informees: D1</text></g>
+<g class="capsule"><rect x="488" y="256" width="150" height="96" rx="8"/><text class="th" x="563" y="272">C1: capsule</text><text class="ts" x="563" y="291">signatory: D1</text><text class="ts" x="563" y="308">observers: D2</text><text class="ts" x="563" y="325">Fetch: any viewer</text><text class="ts" x="563" y="342">Archive: D1</text></g>
+<g class="marker"><rect x="488" y="368" width="150" height="96" rx="8"/><text class="th" x="563" y="384">M1: marker</text><text class="ts" x="563" y="403">signatory: D1</text><text class="ts" x="563" y="420">observers: A</text><text class="ts" x="563" y="437">Merge: D1, A</text><text class="ts" x="563" y="454">Close: A</text></g>
+<line x1="348" y1="288" x2="359" y2="288" class="arr" marker-end="url(#arrow)"/>
+<line x1="474" y1="288" x2="485" y2="288" class="arr" marker-end="url(#arrow)"/>
+<path d="M417 322 L417 416 L485 416" class="arr" marker-end="url(#arrow)"/>
+<g class="ex"><rect x="196" y="388" width="150" height="64" rx="8"/><text class="th" x="271" y="404">CreateSublicense</text><text class="ts" x="271" y="423">on L1, by D2</text><text class="ts" x="271" y="440">informees: D1, D2</text></g>
+<line x1="271" y1="370" x2="271" y2="385" class="arr" marker-end="url(#arrow)"/>
+<line x1="271" y1="454" x2="271" y2="469" class="arr" marker-end="url(#arrow)"/>
+<path d="M196 420 L110 420 L110 469" class="arr" marker-end="url(#arrow)"/>
+
+<g class="delegate"><rect x="40" y="472" width="140" height="112" rx="8"/><text class="th" x="110" y="488">delegate L2</text><text class="ts" x="110" y="506">signatory: D2</text><text class="ts" x="110" y="523">observers: D3, A</text><text class="ts" x="110" y="540">OnDistribute: D2</text><text class="ts" x="110" y="557">Subdelegate:</text><text class="ts" x="110" y="574">D2 with D3</text></g>
+<g class="license"><rect x="196" y="472" width="150" height="112" rx="8"/><text class="th" x="271" y="488">L2: license</text><text class="ts" x="271" y="506">signatory: D2</text><text class="ts" x="271" y="523">observers: O, D1, D3</text><text class="ts" x="271" y="540">Distribute: D2</text><text class="ts" x="271" y="557">CreateSublicense: D3</text><text class="ts" x="271" y="574">Revoke: D1 or O</text></g>
+<g class="ex"><rect x="362" y="472" width="110" height="64" rx="8"/><text class="th" x="417" y="488">Distribute</text><text class="ts" x="417" y="507">on L2, by D2</text><text class="ts" x="417" y="524">informees: D2</text></g>
+<g class="capsule"><rect x="488" y="472" width="150" height="96" rx="8"/><text class="th" x="563" y="488">C2: capsule</text><text class="ts" x="563" y="507">signatory: D2</text><text class="ts" x="563" y="524">observers: D3</text><text class="ts" x="563" y="541">Fetch: any viewer</text><text class="ts" x="563" y="558">Archive: D2</text></g>
+<g class="marker"><rect x="488" y="584" width="150" height="96" rx="8"/><text class="th" x="563" y="600">M2: marker</text><text class="ts" x="563" y="619">signatory: D2</text><text class="ts" x="563" y="636">observers: A</text><text class="ts" x="563" y="653">Merge: D2, A</text><text class="ts" x="563" y="670">Close: A</text></g>
+<line x1="348" y1="504" x2="359" y2="504" class="arr" marker-end="url(#arrow)"/>
+<line x1="474" y1="504" x2="485" y2="504" class="arr" marker-end="url(#arrow)"/>
+<path d="M417 538 L417 632 L485 632" class="arr" marker-end="url(#arrow)"/>
+<g class="ex"><rect x="196" y="604" width="150" height="64" rx="8"/><text class="th" x="271" y="620">CreateSublicense</text><text class="ts" x="271" y="639">on L2, by D3</text><text class="ts" x="271" y="656">informees: D2, D3</text></g>
+<line x1="271" y1="586" x2="271" y2="601" class="arr" marker-end="url(#arrow)"/>
+
+<text class="dots" x="110" y="698">⋮</text>
+<text class="dots" x="271" y="698">⋮</text>
+<text class="dots" x="417" y="698">⋮</text>
+<text class="dots" x="563" y="698">⋮</text>
+
+<g class="ex"><rect x="196" y="716" width="150" height="64" rx="8"/><text class="th" x="271" y="732">CreateSublicense</text><text class="ts" x="271" y="751">on Ln−1, by Dn</text><text class="ts" x="271" y="768">informees: Dn−1, Dn</text></g>
+<line x1="271" y1="782" x2="271" y2="797" class="arr" marker-end="url(#arrow)"/>
+<path d="M196 748 L110 748 L110 797" class="arr" marker-end="url(#arrow)"/>
+<g class="delegate"><rect x="40" y="800" width="140" height="112" rx="8"/><text class="th" x="110" y="816">delegate Ln</text><text class="ts" x="110" y="834">signatory: Dn</text><text class="ts" x="110" y="851">observers: Dn+1, A</text><text class="ts" x="110" y="868">OnDistribute: Dn</text><text class="ts" x="110" y="885">Subdelegate:</text><text class="ts" x="110" y="902">Dn with Dn+1</text></g>
+<g class="license"><rect x="196" y="800" width="150" height="112" rx="8"/><text class="th" x="271" y="816">Ln: license</text><text class="ts" x="271" y="834">signatory: Dn</text><text class="ts" x="271" y="851">observers: O, Dn−1, Dn+1</text><text class="ts" x="271" y="868">Distribute: Dn</text><text class="ts" x="271" y="885">CreateSublicense: Dn+1</text><text class="ts" x="271" y="902">Revoke: Dn−1 or O</text></g>
+<g class="ex"><rect x="362" y="800" width="110" height="64" rx="8"/><text class="th" x="417" y="816">Distribute</text><text class="ts" x="417" y="835">on Ln, by Dn</text><text class="ts" x="417" y="852">informees: Dn</text></g>
+<g class="capsule"><rect x="488" y="800" width="150" height="96" rx="8"/><text class="th" x="563" y="816">Cn: capsule</text><text class="ts" x="563" y="835">signatory: Dn</text><text class="ts" x="563" y="852">observers: Dn+1</text><text class="ts" x="563" y="869">Fetch: any viewer</text><text class="ts" x="563" y="886">Archive: Dn</text></g>
+<g class="marker"><rect x="488" y="912" width="150" height="96" rx="8"/><text class="th" x="563" y="928">Mn: marker</text><text class="ts" x="563" y="947">signatory: Dn</text><text class="ts" x="563" y="964">observers: A</text><text class="ts" x="563" y="981">Merge: Dn, A</text><text class="ts" x="563" y="998">Close: A</text></g>
+<line x1="348" y1="832" x2="359" y2="832" class="arr" marker-end="url(#arrow)"/>
+<line x1="474" y1="832" x2="485" y2="832" class="arr" marker-end="url(#arrow)"/>
+<path d="M417 866 L417 960 L485 960" class="arr" marker-end="url(#arrow)"/>
+
+<text class="legend" x="40" y="1032">O: operator. A: accountant. Dk: distributor of Lk (owner), licensee of Lk−1.</text>
+<text class="legend" x="40" y="1050">Dashed: exercises.</text>
+<text class="legend" x="40" y="1068">Subdelegate controllers: licensor, the delegate's owner, and actor.</text>
+<text class="legend" x="40" y="1086">Through CreateSublicense actor is a licensee; called directly, Dk may be both.</text>
+<text class="legend" x="40" y="1104">Fetch: the Data Standard's PublishedDataPoint_Fetch, by any party that sees the capsule.</text>
+<text class="legend" x="40" y="1122">Every contract also has Archive, by its signatories; a CapsuleArchiver archives capsules too.</text>
+</svg>

@@ -1,0 +1,23 @@
+# Copyright (c) 2026 RedStone. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Build order for the standard's packages: the interface package under
+# interfaces/, the reference implementation in caps-core/, the extensions
+# under extensions/ (extended licensing, accounting, the verifiers), the
+# capsule archiver, the round archiver, then the test fixtures (templates
+# only, no daml-script) and the Daml Script tests.
+#
+# External dependencies are the Canton Data Standard DARs vendored in deps/
+# (canton-data-standard-utils-v1 for AnyValue, canton-data-standard-datapoint-v1
+# for the PublishedDataPoint interface every capsule implements).
+packages:
+- ./interfaces/caps-api-core-v1
+- ./caps-core
+- ./extensions/caps-extended-licensing
+- ./extensions/caps-accounting
+- ./extensions/caps-verifier-redstone
+- ./extensions/caps-verifier-datastandard
+- ./caps-capsule-archiver
+- ./caps-round-archiver
+- ./tests-fixtures
+- ./tests

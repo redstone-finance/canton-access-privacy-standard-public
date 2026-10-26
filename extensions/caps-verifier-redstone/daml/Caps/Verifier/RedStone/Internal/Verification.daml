@@ -1,0 +1,141 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | The checks behind `RedStoneVerifier`, as functions over views. Every
+-- failed check is reported as a `Rejected` reason, including everything the
+-- RedStone SDK reports: a payload it cannot parse, packages outside the
+-- fixing time, a configuration it does not accept.
+module Caps.Verifier.RedStone.Internal.Verification
+  ( verifyContent
+  , verifyRound
+  , verifyFreshness
+  , commitment
+  ) where
+
+import DA.Crypto.Text (fromHex, isHex, keccak256, toHex)
+import DA.List (chunksOf, sort)
+import DA.Numeric (cast)
+import DA.Optional (fromSomeNote)
+import qualified DA.Text as T
+import qualified DA.TextMap as TM
+import DA.Time (RelTime, addRelTime)
+
+import qualified Caps.Api.CoreV1 as Api
+import DataStandard.Utils (AnyValue(..))
+import RedStone.Config (BaseConfig(..), config)
+import RedStone.Error (ErrorCode(..), RedStoneError(..))
+import RedStone.Processor (processPayloadNumeric)
+import RedStone.Result (Result(..))
+
+-- | Authenticity: `Verified` with the round commitment when the data point
+-- carries exactly `feedIds` and the payload's packages, signed by at least
+-- `signerCountThreshold` of `signers`, aggregate to exactly its values at
+-- its fixing time; `Rejected` with every failed check otherwise.
+verifyContent : [Text] -> Int -> [Text] -> Api.CapsuleContent -> Update Api.VerificationResult
+verifyContent signers signerCountThreshold feedIds content =
+  pure $ case (check signers signerCountThreshold feedIds content, commitment content) of
+    ([], Some dataHash) -> Api.Verified dataHash
+    ([], None) -> Api.Rejected [notRedStonePayload]
+    (failed, _) -> Api.Rejected failed
+
+-- | Canonicality: the round is this capsule's, at its fixing time, and
+-- commits to its content.
+verifyRound : Api.CapsuleView -> Api.RoundView -> Api.CheckResult
+verifyRound capsule round = case commitment capsule.content of
+  None -> Api.Failed [notRedStonePayload]
+  Some dataHash -> outcome
+    [ ("round belongs to another definition", round.definition == capsule.definition)
+    , ("round number mismatch", round.roundNumber == capsule.roundNumber)
+    , ("round timestamp differs from the fixing time", round.timestamp == capsule.content.dataPoint.publishedAt)
+    , ("round commitment mismatch", round.dataHash == dataHash)
+    ]
+
+-- | Freshness: the fixing time lies within `maxBehind` before and `maxAhead`
+-- after the reference time.
+verifyFreshness : RelTime -> RelTime -> Api.CapsuleView -> Time -> Api.CheckResult
+verifyFreshness maxBehind maxAhead capsule asOf = outcome
+  [ ("fixing time too far in the past", fixingTime >= addRelTime asOf (negate maxBehind))
+  , ("fixing time too far in the future", fixingTime <= addRelTime asOf maxAhead)
+  ]
+  where
+    fixingTime = capsule.content.dataPoint.publishedAt
+
+-- | `Passed` when every check holds, otherwise the reasons of the failed
+-- ones, in order.
+outcome : [(Api.RejectionReason, Bool)] -> Api.CheckResult
+outcome checks = case [ reason | (reason, ok) <- checks, not ok ] of
+  [] -> Api.Passed
+  failed -> Api.Failed failed
+
+-- | The round commitment: keccak256 of the signed payload itself. A capsule
+-- carries the payload verbatim, so the commitment binds a round to exactly
+-- the node packages it was published from. None when the payload is not
+-- even a hex byte string.
+commitment : Api.CapsuleContent -> Optional Text
+commitment content = case content.payload of
+  AVText hex | isHex hex && T.length hex % 2 == 0 -> Some $ keccak256 hex
+  _ -> None
+
+-- | Every check that fails, in order; empty when the content is authentic.
+check : [Text] -> Int -> [Text] -> Api.CapsuleContent -> [Api.RejectionReason]
+check signers signerCountThreshold feedIds content = case content.payload of
+  AVText payloadHex
+    | map fst feeds /= sort feedIds -> ["data point feeds differ from the verifier's"]
+    | otherwise -> case mapA decimalValue feeds of
+        Left reason -> [reason]
+        Right expected -> case aggregate expected payloadHex of
+          Error e -> [rejection e]
+          Ok results ->
+            concat [ mismatch feedId d result | ((feedId, d), result) <- zip expected results ]
+  _ -> [notRedStonePayload]
+  where
+    dataPoint = content.dataPoint
+    feeds = TM.toList dataPoint.values
+
+    -- The SDK's per-feed aggregates, in the data point's feed order. The
+    -- window is zero, so the packages carry exactly the fixing time.
+    aggregate expected payloadHex =
+      case config (baseConfig signers signerCountThreshold) (map (feedIdBytes . fst) expected) dataPoint.publishedAt of
+        Error e -> Error e
+        Ok cfg -> case processPayloadNumeric cfg payloadHex of
+          Error e -> Error e
+          Ok (results, _) -> Ok results
+
+    decimalValue (feedId, AVDecimal d) = Right (feedId, d)
+    decimalValue (feedId, _) = Left $ "value of " <> feedId <> " is not a decimal"
+
+    mismatch feedId d (Ok v)
+      | cast v == d = []
+      | otherwise = ["aggregate of " <> feedId <> " does not match the data point"]
+    mismatch feedId _ (Error e) =
+      ["verification of " <> feedId <> " failed: " <> show e]
+
+notRedStonePayload : Api.RejectionReason
+notRedStonePayload = "payload must be the hex text of a RedStone payload"
+
+-- | A failure the SDK reports, as a reason: its kind from the code and its
+-- message. The shown argument is left out, it can be the whole payload.
+rejection : RedStoneError Text -> Api.RejectionReason
+rejection e = kind <> ": " <> e.message
+  where
+    kind = case e.code of
+      Configuration -> "verifier configuration rejected"
+      Parse -> "malformed RedStone payload"
+      Verification -> "payload packages rejected"
+      Processing -> "payload aggregation rejected"
+
+-- | The SDK's base configuration with a zero time window: every package
+-- must carry exactly the fixing time.
+baseConfig : [Text] -> Int -> BaseConfig
+baseConfig signers signerCountThreshold = BaseConfig with
+  signers
+  signerCountThreshold
+  maxAllowedPackageTimestampDelayMs = 0
+  maxAllowedPackageTimestampAheadMs = 0
+
+-- | A feed id as the byte list the SDK configures feeds with: its UTF-8
+-- bytes, which is how the nodes encode it.
+feedIdBytes : Text -> [Int]
+feedIdBytes feedId = map (byte . T.implode) $ chunksOf 2 $ T.explode $ toHex feedId
+  where
+    byte pair = fromSomeNote ("bad hex byte " <> pair) $ fromHex pair

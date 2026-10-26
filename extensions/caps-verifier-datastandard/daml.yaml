@@ -1,0 +1,21 @@
+# Copyright (c) 2026 RedStone. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+sdk-version: 3.5.12
+name: caps-verifier-datastandard
+version: 0.1.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+data-dependencies:
+  - ../../deps/canton-data-standard-utils-v1-0.2.0.dar
+  - ../../deps/canton-data-standard-datapoint-v1-0.2.0.dar
+  - ../../deps/canton-data-standard-distributor-key-v1-0.2.0.dar
+  - ../../deps/canton-data-standard-codecs-0.2.0.dar
+  - ../../interfaces/caps-api-core-v1/.daml/dist/caps-api-core-v1-0.1.0.dar
+build-options:
+  - --explicit-serializable=yes
+  - --ghc-option=-Wunused-binds
+  - --ghc-option=-Wunused-matches
+  - --target=2.1

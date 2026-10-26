@@ -1,0 +1,168 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Tests of the capsule archiver on rounds published through the reference
+-- implementation with the test verifier: the newest rounds keep their
+-- capsules, an older capsule waits out its keep period, the round head must
+-- be the archiver's definition's, and an actor other than the distributor
+-- archives through disclosure.
+module Test.CapsuleArchiverTest where
+
+import DA.Assert ((===))
+import DA.Optional (isSome)
+import qualified DA.TextMap as TM
+import DA.Time (RelTime, hours, minutes)
+import Daml.Script
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.CapsuleArchiver
+import Caps.Core.DataDefinition
+import Caps.Core.License (License(..))
+import Caps.Test.Fixtures.TestVerifier
+import DataStandard.DataPointV1 (PublishedDataPointView(..))
+import DataStandard.Utils (AnyValue(..), emptyMetadata)
+
+-- Fixture -------------------------------------------------------------------
+
+data Feed = Feed with
+    operator : Party
+    licensee : Party
+    definition : ContractId Api.DataDefinition
+    otherDefinition : ContractId Api.DataDefinition
+      -- ^ A second definition of the same operator.
+    head : ContractId Api.RoundHead
+      -- ^ The head after round 3.
+    capsules : [ContractId Api.Capsule]
+      -- ^ The root capsules of rounds 1 to 3, published a minute apart.
+    otherCapsule : ContractId Api.Capsule
+      -- ^ The root capsule of round 1 of the second definition.
+
+nodesTag : Text
+nodesTag = "signed-by-nodes"
+
+-- | Three rounds a minute apart; the ledger clock stops at the third. The
+-- licensee reads the feed and holds the root license, so it sees the head,
+-- the rounds and every root capsule.
+setup : Script Feed
+setup = do
+  operator <- allocateParty "Operator"
+  auditor <- allocateParty "Auditor"
+  licensee <- allocateParty "Licensee"
+
+  verifierCid <- submit operator $ createCmd TestVerifier with
+    owner = operator, acceptedTag = nodesTag, observers = [licensee]
+    maxBehind = hours 1, maxAhead = minutes 5
+  let bootstrap dataId = do
+        proposal <- submit operator $ createCmd DefinitionProposal with
+          dataId, operator, auditors = [auditor], readers = [licensee]
+          verifier = toInterfaceContractId verifierCid, publishers = None, accepted = []
+        accepted <- submit auditor $ exerciseCmd proposal DefinitionProposal_Accept with auditor
+        submit operator $ exerciseCmd accepted DefinitionProposal_Finalize
+      rootLicense definition = toInterfaceContractId @Api.License <$> submit operator do
+        createCmd License with
+          definition, owner = operator, licensor = operator
+          operator, licensees = [licensee], licenseType = AVText "root", validUntil = None
+          delegate = None
+  (definitionCid, headCid) <- bootstrap "BTC/USD"
+  (otherDefinitionCid, otherHeadCid) <- bootstrap "ETH/USD"
+  let definition = toInterfaceContractId @Api.DataDefinition definitionCid
+      otherDefinition = toInterfaceContractId @Api.DataDefinition otherDefinitionCid
+  license <- rootLicense definition
+  otherLicense <- rootLicense otherDefinition
+
+  other <- publishNext operator otherLicense (toInterfaceContractId otherHeadCid)
+  first <- publishNext operator license (toInterfaceContractId headCid)
+  second <- publishNext operator license first.head
+  third <- publishNext operator license second.head
+  pure Feed with
+    operator, licensee, definition, otherDefinition
+    head = third.head
+    capsules = map (.capsule) [first, second, third]
+    otherCapsule = other.capsule
+
+-- | Publish the next round a minute after the previous one, as the operator.
+publishNext : Party -> ContractId Api.License -> ContractId Api.RoundHead -> Script Api.CreateRoundResult
+publishNext operator license head = do
+  passTime (minutes 1)
+  now <- getTime
+  submit operator $ exerciseCmd head Api.RoundHead_CreateRound with
+    actor = operator
+    content = Api.CapsuleContent with
+      dataPoint = PublishedDataPointView with
+        distributor = operator, publishedAt = now, schemaVersion = "quote-1"
+        values = TM.fromList [("price", AVDecimal 50000.0)], metadata = emptyMetadata
+      payload = AVText nodesTag
+      license
+
+-- | The operator's archiver for `definition`, keeping the 2 newest rounds,
+-- and an older capsule for `keepPeriod` after its publication.
+createArchiver : Feed -> ContractId Api.DataDefinition -> RelTime -> Script (ContractId CapsuleArchiver)
+createArchiver feed definition keepPeriod = submit feed.operator $ createCmd CapsuleArchiver with
+  distributor = feed.operator, definition, keptRounds = 2, keepPeriod
+
+-- | Archive `feed.capsules` as `actor` against the feed's head.
+archiveAs : Feed -> Party -> ContractId CapsuleArchiver -> Commands [ContractId Api.Capsule]
+archiveAs feed actor archiver = exerciseCmd archiver CapsuleArchiver_Archive with
+  actor, roundHead = feed.head, capsules = feed.capsules
+
+-- | Whether the operator still sees each of the feed's capsules.
+active : Feed -> Script [Bool]
+active feed = mapA (fmap isSome . queryInterfaceContractId feed.operator) feed.capsules
+
+-- Archiving -----------------------------------------------------------------
+
+testKeepsTheNewestRounds : Script ()
+testKeepsTheNewestRounds = do
+  feed <- setup
+  archiver <- createArchiver feed feed.definition (minutes 1)
+  -- Two minutes on, every round is past the keep period; rounds 2 and 3
+  -- stay only as the 2 newest, round 1 goes.
+  passTime (minutes 2)
+  archived <- submit feed.operator $ archiveAs feed feed.operator archiver
+  archived === take 1 feed.capsules
+  remaining <- active feed
+  remaining === [False, True, True]
+
+testWaitsOutTheKeepPeriod : Script ()
+testWaitsOutTheKeepPeriod = do
+  feed <- setup
+  archiver <- createArchiver feed feed.definition (minutes 3)
+  -- Round 1 is two minutes old, within a three-minute keep period.
+  kept <- submit feed.operator $ archiveAs feed feed.operator archiver
+  kept === []
+  passTime (minutes 2)
+  archived <- submit feed.operator $ archiveAs feed feed.operator archiver
+  archived === take 1 feed.capsules
+
+testRejectsAnotherDefinitionsHead : Script ()
+testRejectsAnotherDefinitionsHead = do
+  feed <- setup
+  -- An archiver of the second definition refuses the first one's head.
+  archiver <- createArchiver feed feed.otherDefinition (minutes 1)
+  submitMustFail feed.operator $ archiveAs feed feed.operator archiver
+  remaining <- active feed
+  remaining === [True, True, True]
+
+testRejectsAnotherDefinitionsCapsule : Script ()
+testRejectsAnotherDefinitionsCapsule = do
+  feed <- setup
+  archiver <- createArchiver feed feed.definition (minutes 1)
+  -- A capsule of the second definition among the first one's fails the
+  -- whole archive, the stale round 1 included.
+  submitMustFail feed.operator $ exerciseCmd archiver CapsuleArchiver_Archive with
+    actor = feed.operator, roundHead = feed.head, capsules = feed.otherCapsule :: feed.capsules
+  remaining <- active feed
+  remaining === [True, True, True]
+
+testAnyActorArchives : Script ()
+testAnyActorArchives = do
+  feed <- setup
+  archiver <- createArchiver feed feed.definition (minutes 1)
+  -- The licensee sees the head, the rounds and the root capsules but not
+  -- the archiver; with the archiver disclosed, it archives with the
+  -- distributor's authority.
+  submitMustFail feed.licensee $ archiveAs feed feed.licensee archiver
+  Some archiverDisclosure <- queryDisclosure feed.operator archiver
+  archived <- submit (actAs feed.licensee <> disclose archiverDisclosure) $
+    archiveAs feed feed.licensee archiver
+  archived === take 1 feed.capsules

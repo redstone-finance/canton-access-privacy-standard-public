@@ -1,0 +1,61 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | A CAPS `Verifier` for RedStone oracle data.
+--
+-- The capsule's `payload` is a RedStone payload as the oracle nodes sign it
+-- and the gateways serve it: signed data packages, unsigned metadata and
+-- the RedStone marker, hex-encoded. Verification is delegated to the
+-- RedStone Daml SDK, the same code that validates payloads for RedStone's
+-- Canton price feeds: it parses the packages, checks each signature against
+-- the configured node keys with keccak256 and secp256k1, requires a quorum
+-- of distinct signers per feed, and takes the median. The capsule's data
+-- point must carry exactly the configured feeds, each equal to its median.
+--
+-- The round commitment is the keccak256 of the signed payload: a round is
+-- bound to exactly the node packages it was published from, and any RedStone
+-- SDK recomputes the commitment from the payload bytes. A fixing is fresh
+-- within `maxBehind` and `maxAhead` of the reference time.
+module Caps.Verifier.RedStone where
+
+import DA.Time (RelTime)
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.Verifier.RedStone.Internal.Verification
+
+-- | The verifier. The canonical instance belongs to the operator and must be
+-- visible to publishers through `observers`; a consumer creates its own
+-- instance with the same `signers`, `signerCountThreshold`, `feedIds` and
+-- window.
+template RedStoneVerifier
+  with
+    owner : Party
+    observers : [Party]
+    signers : [Text]
+      -- ^ The oracle nodes' secp256k1 public keys, uncompressed, hex-encoded
+      -- (65 bytes with the 04 prefix, or the 64-byte X||Y).
+    signerCountThreshold : Int
+      -- ^ Minimum number of distinct signers per feed.
+    feedIds : [Text]
+      -- ^ The feeds every capsule must carry, no more and no fewer.
+    maxBehind : RelTime
+      -- ^ How far behind the reference time a fixing time may be.
+    maxAhead : RelTime
+      -- ^ How far ahead of the reference time a fixing time may be.
+  where
+    signatory owner
+    observer observers
+    ensure signerCountThreshold > 0 && signerCountThreshold <= length signers
+      && not (null feedIds)
+
+    interface instance Api.Verifier for RedStoneVerifier where
+      view = Api.VerifierView {}
+
+      verifier_verifyImpl _self arg =
+        verifyContent signers signerCountThreshold feedIds arg.capsule.content
+
+      verifier_verifyRoundImpl _self arg =
+        pure $ verifyRound arg.capsule arg.round
+
+      verifier_verifyFreshnessImpl _self arg =
+        pure $ verifyFreshness maxBehind maxAhead arg.capsule arg.asOf

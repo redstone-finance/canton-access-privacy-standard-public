@@ -1,0 +1,35 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | The reference capsule: generic over the oracle's payload encoding, since
+-- it carries `CapsuleContent` opaquely and leaves authenticity to the
+-- consumer's `Verifier`.
+module Caps.Core.Capsule where
+
+import qualified Caps.Api.CoreV1 as Api
+import DataStandard.DataPointV1 (PublishedDataPoint(..))
+
+-- | A capsule and its audience. The distributor signs it alone, so nothing
+-- about the audience reaches any other party. On a root capsule the
+-- observers are the root license's licensees plus the feed's auditors; on a
+-- distributed one, the clients it was distributed to. Observers of one
+-- capsule see each other.
+template Capsule
+  with
+    definition : ContractId Api.DataDefinition
+    roundNumber : Int
+    content : Api.CapsuleContent
+    distributor : Party
+      -- ^ The signatory. Must equal `content.dataPoint.distributor`, so the
+      -- Data Standard view names the party that actually signed.
+    observers : [Party]
+  where
+    signatory distributor
+    observer observers
+    ensure content.dataPoint.distributor == distributor
+
+    interface instance PublishedDataPoint for Capsule where
+      view = content.dataPoint
+
+    interface instance Api.Capsule for Capsule where
+      view = Api.CapsuleView with definition, roundNumber, content

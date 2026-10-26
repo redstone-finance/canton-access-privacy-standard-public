@@ -1,0 +1,7 @@
+.daml/
+.vscode/
+.DS_Store
+*.dar
+!deps/*.dar
+!dars/*.dar
+.idea/

@@ -1,0 +1,45 @@
+# Copyright (c) 2026 RedStone. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # dpm and the SDK components it fetches are cached per version, so a
+      # run with a warm cache never touches the Digital Asset registry.
+      - name: Cache dpm
+        id: dpm-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.dpm
+          key: dpm-3.5.12-${{ runner.os }}
+
+      # The installer is given the version explicitly: without one it asks
+      # the registry for the "latest" release, an endpoint that has returned
+      # errors and would also move the toolchain under the packages, which
+      # pin SDK 3.5.12 in their daml.yaml.
+      - name: Install dpm
+        if: steps.dpm-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -sSL https://get.digitalasset.com/install/install.sh | sh -s -- 3.5.12
+          "$HOME/.dpm/bin/dpm" install 3.5.12
+
+      - name: Add dpm to PATH
+        run: echo "$HOME/.dpm/bin" >> "$GITHUB_PATH"
+
+      - name: Check headers, build, validate and verify committed DARs
+        run: make ci

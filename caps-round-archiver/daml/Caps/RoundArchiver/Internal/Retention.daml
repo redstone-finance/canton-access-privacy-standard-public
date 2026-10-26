@@ -1,0 +1,23 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | The retention rule behind `RoundArchiver`, over round views.
+module Caps.RoundArchiver.Internal.Retention
+  ( staleRounds
+  ) where
+
+import DA.Action (filterA)
+import DA.Time (addRelTime, isLedgerTimeGT)
+
+import qualified Caps.Api.CoreV1 as Api
+
+-- | The rounds, the genesis round aside, at least `keptRounds` rounds behind
+-- round `roundNumber` whose fixing time lies more than `keepPeriod` before
+-- ledger time, in the order given.
+staleRounds keptRounds keepPeriod roundNumber rounds =
+  filterA (isStale keptRounds keepPeriod roundNumber . snd) rounds
+
+isStale keptRounds keepPeriod roundNumber (round : Api.RoundView) =
+  if round.roundNumber > 0 && round.roundNumber + keptRounds <= roundNumber
+    then isLedgerTimeGT $ addRelTime round.timestamp keepPeriod
+    else pure False

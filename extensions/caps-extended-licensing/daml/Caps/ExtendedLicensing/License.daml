@@ -1,0 +1,215 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | The extended licenses: the open license, which is the root and the
+-- sublicensable kind, paid for by use, and the three prepaid kinds a
+-- sublicense can be created as. Every distribution is reported to the
+-- license's delegate, if any, with its weight in the context: 1.0 for an
+-- open license, 0.0 for a prepaid one.
+--
+-- Provenance is policed as in caps-core: the operator observes every
+-- license at every level and may revoke, as may the licensor.
+module Caps.ExtendedLicensing.License where
+
+import DA.Action (void, when)
+import DA.Assert (assertWithinDeadline)
+import DA.Optional (fromOptional, whenSome)
+import qualified DA.TextMap as TM
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.Core.Distribution (distribute, sublicenseDelegate)
+import Caps.ExtendedLicensing.LicenseType
+import DataStandard.Utils (AnyValue(..), FromAnyValue(..))
+
+-- | The open license: unlimited distributions paid for by use, and the only
+-- kind that can be sublicensed. The root license is one, owned by the
+-- operator and created directly.
+template OpenLicense
+  with
+    definition : ContractId Api.DataDefinition
+    owner : Party
+    licensor : Party
+      -- ^ The owner of the parent license, or the operator for the root.
+    operator : Party
+    licensees : [Party]
+      -- ^ Parties entitled to create a sublicense from this one.
+    validUntil : Optional Time
+    delegate : Optional (ContractId Api.LicenseDelegate)
+      -- ^ Told of every distribution under this license; gives a sublicense
+      -- of any kind its delegate.
+  where
+    signatory owner
+    observer operator, licensor, licensees
+
+    interface instance Api.License for OpenLicense where
+      view = Api.LicenseView with definition, owner, licensees, delegate
+
+      license_distributeImpl self arg = do
+        assertNotExpired validUntil
+        distribute self None definition owner delegate
+          (weightContext paid_distribution_weight) arg
+
+      license_createSublicenseImpl _self arg = do
+        assertNotExpired validUntil
+        assertMsg "actor is not a licensee of this license" $
+          arg.actor `elem` licensees
+        childDelegate <- sublicenseDelegate owner delegate arg
+        case fromAny arg.licenseType of
+          Some Consumable ->
+            toInterfaceContractId <$> create ConsumableLicense with
+              definition, owner = arg.actor, licensor = owner, operator, delegate = childDelegate
+          Some (Subscription end) ->
+            toInterfaceContractId <$> create SubscriptionLicense with
+              definition, owner = arg.actor, licensor = owner, operator, delegate = childDelegate
+              validUntil = end
+          Some (Credits credits) ->
+            toInterfaceContractId <$> create CreditLicense with
+              definition, owner = arg.actor, licensor = owner, operator, delegate = childDelegate
+              credits, origin = None
+          None -> do
+            assertMsg "licenseType names a unit but does not decode" $
+              not $ hasUnit arg.licenseType
+            toInterfaceContractId <$> create OpenLicense with
+              definition, owner = arg.actor, licensor = owner, operator
+              licensees = arg.licensees, validUntil, delegate = childDelegate
+
+    choice OpenLicense_Revoke : ()
+      with
+        revoker : Party
+      controller revoker
+      do assertRevoker revoker licensor operator
+
+-- | One distribution, prepaid, then spent. Cannot be sublicensed.
+template ConsumableLicense
+  with
+    definition : ContractId Api.DataDefinition
+    owner : Party
+    licensor : Party
+    operator : Party
+    delegate : Optional (ContractId Api.LicenseDelegate)
+  where
+    signatory owner
+    observer operator, licensor
+
+    interface instance Api.License for ConsumableLicense where
+      view = Api.LicenseView with definition, owner, licensees = [], delegate
+
+      license_distributeImpl self arg = do
+        exercise (fromInterfaceContractId @ConsumableLicense self) ConsumableLicense_Spend
+        distribute self None definition owner delegate
+          (weightContext prepaid_distribution_weight) arg
+
+      license_createSublicenseImpl _ _ =
+        abort "a consumable license cannot be sublicensed"
+
+    choice ConsumableLicense_Spend : ()
+      controller owner
+      do pure ()
+
+    choice ConsumableLicense_Revoke : ()
+      with
+        revoker : Party
+      controller revoker
+      do assertRevoker revoker licensor operator
+
+-- | Any number of distributions until `validUntil`, prepaid. Cannot be
+-- sublicensed.
+template SubscriptionLicense
+  with
+    definition : ContractId Api.DataDefinition
+    owner : Party
+    licensor : Party
+    operator : Party
+    delegate : Optional (ContractId Api.LicenseDelegate)
+    validUntil : Time
+  where
+    signatory owner
+    observer operator, licensor
+
+    interface instance Api.License for SubscriptionLicense where
+      view = Api.LicenseView with definition, owner, licensees = [], delegate
+
+      license_distributeImpl self arg = do
+        assertWithinDeadline "subscription license has expired" validUntil
+        distribute self None definition owner delegate
+          (weightContext prepaid_distribution_weight) arg
+
+      license_createSublicenseImpl _ _ =
+        abort "a subscription license cannot be sublicensed"
+
+    choice SubscriptionLicense_Revoke : ()
+      with
+        revoker : Party
+      controller revoker
+      do assertRevoker revoker licensor operator
+
+-- | `credits` distributions, prepaid. Each distribution spends one by
+-- replacing the contract; the delegate is told the license as issued
+-- through `origin`. Cannot be sublicensed.
+template CreditLicense
+  with
+    definition : ContractId Api.DataDefinition
+    owner : Party
+    licensor : Party
+    operator : Party
+    delegate : Optional (ContractId Api.LicenseDelegate)
+    credits : Int
+    origin : Optional (ContractId Api.License)
+      -- ^ The contract id this license was issued with; None on the first
+      -- contract, which is the origin itself.
+  where
+    signatory owner
+    observer operator, licensor
+    ensure credits > 0
+
+    interface instance Api.License for CreditLicense where
+      view = Api.LicenseView with definition, owner, licensees = [], delegate
+
+      license_distributeImpl self arg = do
+        exercise (fromInterfaceContractId @CreditLicense self) CreditLicense_Spend
+        distribute self origin definition owner delegate
+          (weightContext prepaid_distribution_weight) arg
+
+      license_createSublicenseImpl _ _ =
+        abort "a credit license cannot be sublicensed"
+
+    choice CreditLicense_Spend : ()
+      controller owner
+      do
+        when (credits > 1) $ void $ create this with
+          credits = credits - 1
+          origin = Some $ fromOptional (toInterfaceContractId self) origin
+
+    choice CreditLicense_Revoke : ()
+      with
+        revoker : Party
+      controller revoker
+      do assertRevoker revoker licensor operator
+
+-- | A distribution paid for by use.
+paid_distribution_weight : Decimal
+paid_distribution_weight = 1.0
+
+-- | A distribution covered by a prepaid license: recorded, not charged.
+prepaid_distribution_weight : Decimal
+prepaid_distribution_weight = 0.0
+
+-- | The context these licenses report a distribution with: a map holding
+-- the weight their terms give the distribution under `weight_key`.
+weightContext weight =
+  Some $ AVMap $ TM.fromList [(weight_key, AVDecimal weight)]
+
+-- | The key of the weight in the context of a distribution report.
+weight_key = "weight"
+
+-- | The rule of the `*_Revoke` choices in this package: the licensor or
+-- the operator, neither a signatory.
+assertRevoker : Party -> Party -> Party -> Update ()
+assertRevoker revoker licensor operator =
+  assertMsg "only the licensor or the operator may revoke" $
+    revoker == licensor || revoker == operator
+
+assertNotExpired : Optional Time -> Update ()
+assertNotExpired validUntil = do
+  now <- getTime
+  whenSome validUntil $ \t -> assertMsg "license expired" $ now <= t

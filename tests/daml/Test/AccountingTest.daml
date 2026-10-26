@@ -1,0 +1,615 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Tests of the extended licenses and the accounting delegate: every
+-- distribution through a license that names the delegate leaves a marker
+-- for the accountants and nobody else, a distribution touches no root
+-- contract of the operator, each prepaid kind behaves as its
+-- terms say, either side merges markers to compact them, and only an
+-- accountant settles a period.
+module Test.AccountingTest where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.List (sort, sortOn)
+import DA.Optional (isNone, isSome)
+import qualified DA.TextMap as TM
+import DA.Time (addRelTime, hours, minutes)
+import Daml.Script
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.Accounting.AccountingDelegate
+import Caps.Accounting.DistributionMarker
+import Caps.Accounting.SettlementHead
+import Caps.Core.DataDefinition
+import Caps.Core.License (License(..))
+import Caps.ExtendedLicensing.License
+import Caps.ExtendedLicensing.LicenseType
+import Caps.Test.Fixtures.TestVerifier
+import DataStandard.DataPointV1 (PublishedDataPointView(..))
+import DataStandard.Utils (AnyValue(..), ToAnyValue(..), emptyMetadata)
+
+-- Fixture -------------------------------------------------------------------
+
+data Feed = Feed with
+    operator : Party
+    accountant : Party
+    licensee : Party
+      -- ^ Licensee of both root licenses.
+    consumer : Party
+    client : Party
+    stranger : Party
+    definition : ContractId Api.DataDefinition
+    otherDefinition : ContractId Api.DataDefinition
+    rootLicense : ContractId Api.License
+    capsules : [ContractId Api.Capsule]
+      -- ^ The root capsules of rounds 1 and 2.
+    otherCapsule : ContractId Api.Capsule
+      -- ^ The root capsule of round 1 of the other definition.
+
+nodesTag : Text
+nodesTag = "signed-by-nodes"
+
+-- | Two definitions of one operator, each with a root license whose
+-- delegate reports to an accountant of its own and whose licensee is
+-- `licensee`; two rounds published on the first, one on the second.
+setup : Script Feed
+setup = do
+  operator <- allocateParty "Operator"
+  auditor <- allocateParty "Auditor"
+  accountant <- allocateParty "Accountant"
+  licensee <- allocateParty "Licensee"
+  consumer <- allocateParty "Consumer"
+  client <- allocateParty "Client"
+  stranger <- allocateParty "Stranger"
+
+  verifierCid <- submit operator $ createCmd TestVerifier with
+    owner = operator, acceptedTag = nodesTag, observers = []
+    maxBehind = hours 1, maxAhead = minutes 5
+  let bootstrap dataId = do
+        proposal <- submit operator $ createCmd DefinitionProposal with
+          dataId, operator, auditors = [auditor], readers = []
+          verifier = toInterfaceContractId verifierCid, publishers = None, accepted = []
+        accepted <- submit auditor $ exerciseCmd proposal DefinitionProposal_Accept with auditor
+        (definitionCid, headCid) <- submit operator $ exerciseCmd accepted DefinitionProposal_Finalize
+        let definition = toInterfaceContractId @Api.DataDefinition definitionCid
+        delegate <- submit operator $ createCmd AccountingDelegate with
+          owner = operator, accountants = [accountant], licensees = [licensee], definition
+        rootLicenseCid <- submit operator $ createCmd OpenLicense with
+          definition, owner = operator, licensor = operator, operator
+          licensees = [licensee], validUntil = None
+          delegate = Some $ toInterfaceContractId delegate
+        pure (definition, toInterfaceContractId @Api.RoundHead headCid, toInterfaceContractId @Api.License rootLicenseCid)
+  (definition, head, rootLicense) <- bootstrap "BTC/USD"
+  (otherDefinition, otherHead, otherRootLicense) <- bootstrap "ETH/USD"
+
+  first <- publishNext operator rootLicense head
+  second <- publishNext operator rootLicense first.head
+  other <- publishNext operator otherRootLicense otherHead
+  pure Feed with
+    operator, accountant, licensee, consumer, client, stranger
+    definition, otherDefinition, rootLicense
+    capsules = map (.capsule) [first, second]
+    otherCapsule = other.capsule
+
+-- | Publish the next round a minute after the previous one, as the operator.
+publishNext : Party -> ContractId Api.License -> ContractId Api.RoundHead -> Script Api.CreateRoundResult
+publishNext operator license head = do
+  passTime (minutes 1)
+  now <- getTime
+  submit operator $ exerciseCmd head Api.RoundHead_CreateRound with
+    actor = operator
+    content = Api.CapsuleContent with
+      dataPoint = PublishedDataPointView with
+        distributor = operator, publishedAt = now, schemaVersion = "quote-1"
+        values = TM.fromList [("price", AVDecimal 50000.0)], metadata = emptyMetadata
+      payload = AVText nodesTag
+      license
+
+-- | A sublicense of `parent` owned by `actor`: open when `kind` is None,
+-- otherwise of the prepaid kind `kind` encodes.
+sublicense : Party -> ContractId Api.License -> Optional LicenseTerms -> [Party] -> Script (ContractId Api.License)
+sublicense actor parent kind licensees = submit actor $
+  exerciseCmd parent Api.License_CreateSublicense with
+    actor, licenseType = optional (AVText "open") toAny kind, licensees
+
+distribute : ContractId Api.License -> Api.CapsuleSource -> [Party] -> Commands (ContractId Api.Capsule)
+distribute license source clients = exerciseCmd license Api.License_Distribute with source, clients
+
+capsuleView : Party -> ContractId Api.Capsule -> Script Api.CapsuleView
+capsuleView reader capsule = do
+  Some v <- queryInterfaceContractId reader capsule
+  pure v
+
+licenseView reader license = do
+  Some v <- queryInterfaceContractId reader license
+  pure v
+
+markersOf : Party -> Script [DistributionMarker]
+markersOf party = map snd <$> query @DistributionMarker party
+
+consumable, twoCredits : LicenseTerms
+consumable = Consumable
+twoCredits = Credits 2
+
+-- | A subscription until an hour from now.
+hourSubscription = do
+  now <- getTime
+  pure $ Subscription $ addRelTime now (hours 1)
+
+-- | The licensee's open sublicense with `consumer` as its licensee, and the
+-- view of the root capsule of round 1.
+licenseeSetup : Feed -> Script (ContractId Api.License, Api.CapsuleView)
+licenseeSetup feed = do
+  sub <- sublicense feed.licensee feed.rootLicense None [feed.consumer]
+  let [round1, _] = feed.capsules
+  root <- capsuleView feed.licensee round1
+  pure (sub, root)
+
+-- Markers -------------------------------------------------------------------
+
+testDistributionLeavesMarker : Script ()
+testDistributionLeavesMarker = do
+  feed <- setup
+  (sub, root) <- licenseeSetup feed
+  capsule <- submit feed.licensee $ distribute sub (Api.ByView root) [feed.consumer]
+  [marker] <- markersOf feed.accountant
+  marker === DistributionMarker with
+    distributor = feed.licensee, accountants = [feed.accountant], definition = feed.definition
+    license = sub, fromRound = 1, toRound = 1, count = 1, weight = paid_distribution_weight
+    capsule = Some capsule, closed = None, sequence = None
+
+testOperatorAndClientSeeNoMarkers : Script ()
+testOperatorAndClientSeeNoMarkers = do
+  feed <- setup
+  (sub, root) <- licenseeSetup feed
+  _ <- submit feed.licensee $ distribute sub (Api.ByView root) [feed.consumer]
+  forA_ [feed.operator, feed.consumer, feed.stranger] $ \party -> do
+    markers <- markersOf party
+    markers === []
+
+testMarkerIsTheDistributorsAlone : Script ()
+testMarkerIsTheDistributorsAlone = do
+  feed <- setup
+  (sub, root) <- licenseeSetup feed
+  capsule <- submit feed.licensee $ distribute sub (Api.ByView root) [feed.consumer]
+  [(markerCid, marker)] <- query @DistributionMarker feed.accountant
+  -- The accountant observes and cannot archive; nobody can mint a marker in
+  -- the distributor's name.
+  submitMustFail feed.accountant $ archiveCmd markerCid
+  submitMustFail feed.accountant $ createCmd marker with capsule = Some capsule
+  submitMustFail feed.stranger $ createCmd marker with accountants = [feed.stranger]
+
+testAccountantSeesDelegatesNotLicensesOrCapsules : Script ()
+testAccountantSeesDelegatesNotLicensesOrCapsules = do
+  feed <- setup
+  (sub, root) <- licenseeSetup feed
+  _ <- sublicense feed.consumer sub (Some consumable) []
+  capsule <- submit feed.licensee $ distribute sub (Api.ByView root) [feed.consumer]
+  -- Each delegate in the chain is seen by its owner, the licensees of the
+  -- licenses that name it and its accountants; the accountant sees neither
+  -- the licenses nor what was distributed.
+  owners <- forA [feed.operator, feed.licensee, feed.consumer, feed.accountant] $ \party ->
+    sort . map ((.owner) . snd) <$> query @AccountingDelegate party
+  owners === map sort
+    [ [feed.operator, feed.operator], [feed.operator, feed.operator, feed.licensee]
+    , [feed.licensee, feed.consumer]
+    , [feed.operator, feed.operator, feed.licensee, feed.consumer] ]
+  open <- query @OpenLicense feed.accountant
+  map fst open === []
+  prepaid <- query @ConsumableLicense feed.accountant
+  map fst prepaid === []
+  seen <- queryInterfaceContractId feed.accountant capsule
+  assert $ isNone seen
+
+-- Delegate ------------------------------------------------------------------
+
+testLicenseWithoutDelegateLeavesNoMarker : Script ()
+testLicenseWithoutDelegateLeavesNoMarker = do
+  feed <- setup
+  (_, root) <- licenseeSetup feed
+  plain <- toInterfaceContractId @Api.License <$> submit feed.operator (createCmd OpenLicense with
+    definition = feed.definition, owner = feed.operator, licensor = feed.operator
+    operator = feed.operator, licensees = [feed.licensee], validUntil = None, delegate = None)
+  sub <- sublicense feed.licensee plain None []
+  _ <- submit feed.licensee $ distribute sub (Api.ByView root) [feed.consumer]
+  v <- licenseView feed.licensee sub
+  v.delegate === None
+  markers <- markersOf feed.accountant
+  markers === []
+
+-- | A reference license of caps-core with an accounting delegate, and the
+-- licensee's sublicense of it with `consumer` as its licensee.
+coreSublicense feed = do
+  delegate <- toInterfaceContractId <$> submit feed.operator (createCmd AccountingDelegate with
+    owner = feed.operator, accountants = [feed.accountant], licensees = [feed.licensee]
+    definition = feed.definition)
+  coreRoot <- toInterfaceContractId @Api.License <$> submit feed.operator (createCmd License with
+    definition = feed.definition, owner = feed.operator, licensor = feed.operator
+    operator = feed.operator, licensees = [feed.licensee], licenseType = AVText "core"
+    validUntil = None, delegate = Some delegate)
+  submit feed.licensee $ exerciseCmd coreRoot Api.License_CreateSublicense with
+    actor = feed.licensee, licenseType = AVText "core", licensees = [feed.consumer]
+
+-- | The reference license of caps-core subdelegates through the accounting
+-- delegate like any other license.
+testCoreLicenseSubdelegates : Script ()
+testCoreLicenseSubdelegates = do
+  feed <- setup
+  sub <- coreSublicense feed
+  Some childDelegate <- (.delegate) <$> licenseView feed.licensee sub
+  Some child <- queryContractId feed.consumer $ fromInterfaceContractId @AccountingDelegate childDelegate
+  child === AccountingDelegate with
+    owner = feed.licensee, accountants = [feed.accountant], licensees = [feed.consumer]
+    definition = feed.definition
+
+-- | The reference license of caps-core reports no context, so the accounting
+-- delegate accounts its distributions at the default weight.
+testCoreLicenseIsAccountedAtTheDefaultWeight : Script ()
+testCoreLicenseIsAccountedAtTheDefaultWeight = do
+  feed <- setup
+  (_, root) <- licenseeSetup feed
+  sub <- coreSublicense feed
+  capsule <- submit feed.licensee $ distribute sub (Api.ByView root) [feed.consumer]
+  [marker] <- markersOf feed.accountant
+  (marker.distributor, marker.license, marker.capsule, marker.weight)
+    === (feed.licensee, sub, Some capsule, default_weight)
+
+-- | A context that carries no decimal weight is a license that priced the
+-- distribution wrongly, not one that priced nothing: the report is refused.
+testAccountingRefusesAContextWithoutWeight : Script ()
+testAccountingRefusesAContextWithoutWeight = do
+  feed <- setup
+  Some rootDelegate <- (.delegate) <$> licenseView feed.operator feed.rootLicense
+  let [round1, _] = feed.capsules
+      report context = submitMustFail feed.operator $
+        exerciseCmd rootDelegate Api.LicenseDelegate_OnDistribute with
+          distributor = feed.operator, license = feed.rootLicense, roundNumber = 1
+          capsule = Some round1, clients = None, context
+  report $ Some $ AVMap TM.empty
+  report $ Some $ AVMap $ TM.fromList [("weight", AVInt 1)]
+  report $ Some $ AVText "weight"
+  markers <- markersOf feed.accountant
+  markers === []
+
+testDelegateRefusesAnotherDistributor : Script ()
+testDelegateRefusesAnotherDistributor = do
+  feed <- setup
+  -- The licensee observes the root license's delegate, since it sublicenses
+  -- through it, but cannot report to it in its own name.
+  Some rootDelegate <- (.delegate) <$> licenseView feed.licensee feed.rootLicense
+  let [round1, _] = feed.capsules
+  submitMustFail feed.licensee $ exerciseCmd rootDelegate Api.LicenseDelegate_OnDistribute with
+    distributor = feed.licensee, license = feed.rootLicense, roundNumber = 1
+    capsule = Some round1, clients = None, context = weightContext paid_distribution_weight
+  markers <- markersOf feed.accountant
+  markers === []
+
+testDelegateSubdelegatesOnlyForItsOwner : Script ()
+testDelegateSubdelegatesOnlyForItsOwner = do
+  feed <- setup
+  Some rootDelegate <- (.delegate) <$> licenseView feed.licensee feed.rootLicense
+  let attempt licensor = submitMustFail feed.licensee $
+        exerciseCmd rootDelegate Api.LicenseDelegate_Subdelegate with
+          licensor, actor = feed.licensee, licenseType = AVText "open", licensees = []
+  -- Outside a sublicense the licensee lacks the owner's authority, and the
+  -- delegate refuses any other licensor.
+  attempt feed.operator
+  attempt feed.licensee
+
+-- Distribution --------------------------------------------------------------
+
+testSecondLevelDistributionTouchesNoRootContract : Script ()
+testSecondLevelDistributionTouchesNoRootContract = do
+  feed <- setup
+  (sub, root) <- licenseeSetup feed
+  derived <- submit feed.licensee $ distribute sub (Api.ByView root) [feed.consumer]
+  sub2 <- sublicense feed.consumer sub None []
+  -- The consumer sees neither the root license, nor its delegate, nor the
+  -- root capsule, so a distribution that reached any of them would fail.
+  rootView <- queryInterfaceContractId feed.consumer feed.rootLicense
+  assert $ isNone rootView
+  Some rootDelegate <- (.delegate) <$> licenseView feed.licensee feed.rootLicense
+  rootDelegateSeen <- queryInterfaceContractId feed.consumer rootDelegate
+  assert $ isNone rootDelegateSeen
+  let [round1, _] = feed.capsules
+  rootCapsule <- queryInterfaceContractId feed.consumer round1
+  assert $ isNone rootCapsule
+  redistributed <- submit feed.consumer $ distribute sub2 (Api.ById derived) [feed.client]
+  Some v <- queryInterfaceContractId feed.client redistributed
+  v.content.dataPoint.distributor === feed.consumer
+  v.content.license === sub2
+  [marker] <- filter (\m -> m.distributor == feed.consumer) <$> markersOf feed.accountant
+  (marker.license, marker.capsule, marker.fromRound) === (sub2, Some redistributed, 1)
+
+testSublicenseRequiresEntitlement : Script ()
+testSublicenseRequiresEntitlement = do
+  feed <- setup
+  -- The operator owns the root license but is not among its licensees.
+  submitMustFail feed.operator $ exerciseCmd feed.rootLicense Api.License_CreateSublicense with
+    actor = feed.operator, licenseType = AVText "open", licensees = []
+
+testOnlyOwnerDistributes : Script ()
+testOnlyOwnerDistributes = do
+  feed <- setup
+  (sub, root) <- licenseeSetup feed
+  -- The operator observes the sublicense but does not own it.
+  submitMustFail feed.operator $ distribute sub (Api.ByView root) [feed.consumer]
+
+testRejectsAnotherDefinitionsCapsule : Script ()
+testRejectsAnotherDefinitionsCapsule = do
+  feed <- setup
+  (sub, _) <- licenseeSetup feed
+  other <- capsuleView feed.licensee feed.otherCapsule
+  submitMustFail feed.licensee $ distribute sub (Api.ByView other) [feed.consumer]
+
+testRevokedLicenseCannotDistribute : Script ()
+testRevokedLicenseCannotDistribute = do
+  feed <- setup
+  (sub, root) <- licenseeSetup feed
+  let subCid = fromInterfaceContractId @OpenLicense sub
+  -- A licensee of the sublicense sees it but may not revoke it.
+  submitMustFail feed.consumer $ exerciseCmd subCid OpenLicense_Revoke with revoker = feed.consumer
+  submit feed.operator $ exerciseCmd subCid OpenLicense_Revoke with revoker = feed.operator
+  submitMustFail feed.licensee $ distribute sub (Api.ByView root) [feed.consumer]
+
+-- Prepaid kinds -------------------------------------------------------------
+
+testConsumableLicenseDistributesOnce : Script ()
+testConsumableLicenseDistributesOnce = do
+  feed <- setup
+  (_, root) <- licenseeSetup feed
+  sub <- sublicense feed.licensee feed.rootLicense (Some consumable) []
+  _ <- submit feed.licensee $ distribute sub (Api.ByView root) [feed.consumer]
+  [marker] <- markersOf feed.accountant
+  marker.weight === prepaid_distribution_weight
+  submitMustFail feed.licensee $ distribute sub (Api.ByView root) [feed.consumer]
+
+testMalformedTermsAreRefused : Script ()
+testMalformedTermsAreRefused = do
+  feed <- setup
+  let attempt licenseType = submitMustFail feed.licensee $
+        exerciseCmd feed.rootLicense Api.License_CreateSublicense with
+          actor = feed.licensee, licenseType, licensees = []
+  -- A unit without an amount, a fractional amount, a subscription without
+  -- its end, an unknown unit.
+  attempt $ AVMap $ TM.fromList [("unit", AVText unit_credits)]
+  attempt $ AVMap $ TM.fromList [("unit", AVText unit_credits), ("amount", AVDecimal 2.5)]
+  attempt $ AVMap $ TM.fromList [("unit", AVText unit_subscription), ("amount", AVInt 3600)]
+  attempt $ AVMap $ TM.fromList [("unit", AVText "months"), ("amount", AVInt 1)]
+  -- Anything without a unit is an open sublicense.
+  _ <- sublicense feed.licensee feed.rootLicense None []
+  pure ()
+
+testSubscriptionLicenseIsRecordedNotChargedAndExpires : Script ()
+testSubscriptionLicenseIsRecordedNotChargedAndExpires = do
+  feed <- setup
+  (_, root) <- licenseeSetup feed
+  subscription <- hourSubscription
+  sub <- sublicense feed.licensee feed.rootLicense (Some subscription) []
+  _ <- submit feed.licensee $ distribute sub (Api.ByView root) [feed.consumer]
+  _ <- submit feed.licensee $ distribute sub (Api.ByView root) [feed.client]
+  markers <- markersOf feed.accountant
+  map (.weight) markers === [prepaid_distribution_weight, prepaid_distribution_weight]
+  map (.count) markers === [1, 1]
+  passTime (hours 2)
+  submitMustFail feed.licensee $ distribute sub (Api.ByView root) [feed.consumer]
+
+testCreditLicenseCountsDownAndKeepsItsOrigin : Script ()
+testCreditLicenseCountsDownAndKeepsItsOrigin = do
+  feed <- setup
+  (_, root) <- licenseeSetup feed
+  sub <- sublicense feed.licensee feed.rootLicense (Some twoCredits) []
+  _ <- submit feed.licensee $ distribute sub (Api.ByView root) [feed.consumer]
+  -- The contract was replaced with one credit left and the issued id kept.
+  [(remaining, license)] <- query @CreditLicense feed.licensee
+  (license.credits, license.origin) === (1, Some sub)
+  _ <- submit feed.licensee $ distribute (toInterfaceContractId remaining) (Api.ByView root) [feed.client]
+  spent <- query @CreditLicense feed.licensee
+  spent === []
+  -- Both markers name the license as issued, not the replacement.
+  markers <- markersOf feed.accountant
+  map (.license) markers === [sub, sub]
+  map (.weight) markers === [prepaid_distribution_weight, prepaid_distribution_weight]
+
+testPrepaidLicensesCannotBeSublicensed : Script ()
+testPrepaidLicensesCannotBeSublicensed = do
+  feed <- setup
+  subscription <- hourSubscription
+  forA_ [consumable, subscription, twoCredits] $ \kind -> do
+    sub <- sublicense feed.licensee feed.rootLicense (Some kind) [feed.consumer]
+    submitMustFail feed.consumer $ exerciseCmd sub Api.License_CreateSublicense with
+      actor = feed.consumer, licenseType = AVText "open", licensees = []
+
+-- Merging -------------------------------------------------------------------
+
+-- | Three distributions under the licensee's open sublicense: rounds 1, 2
+-- and 1 again, each leaving a marker.
+threeMarkers : Feed -> Script (ContractId Api.License, [ContractId DistributionMarker])
+threeMarkers feed = do
+  (sub, round1) <- licenseeSetup feed
+  let [_, c2] = feed.capsules
+  round2 <- capsuleView feed.licensee c2
+  forA_ [round1, round2, round1] $ \source ->
+    submit feed.licensee $ distribute sub (Api.ByView source) [feed.consumer]
+  markers <- map fst <$> query @DistributionMarker feed.accountant
+  pure (sub, markers)
+
+testAccountantMergesMarkers : Script ()
+testAccountantMergesMarkers = do
+  feed <- setup
+  (sub, [m1, m2, m3]) <- threeMarkers feed
+  merged <- submit feed.accountant $ exerciseCmd m1 DistributionMarker_Merge with
+    actor = feed.accountant, others = [m2, m3]
+  forA_ [feed.accountant, feed.licensee] $ \party -> do
+    [(cid, marker)] <- query @DistributionMarker party
+    cid === merged
+    marker === DistributionMarker with
+      distributor = feed.licensee, accountants = [feed.accountant], definition = feed.definition
+      license = sub, fromRound = 1, toRound = 2, count = 3, weight = 3.0 * paid_distribution_weight
+      capsule = None, closed = None, sequence = None
+
+testDistributorMergesItsOwnMarkers : Script ()
+testDistributorMergesItsOwnMarkers = do
+  feed <- setup
+  (_, [m1, m2, m3]) <- threeMarkers feed
+  merged <- submit feed.licensee $ exerciseCmd m1 DistributionMarker_Merge with
+    actor = feed.licensee, others = [m2, m3]
+  [(cid, marker)] <- query @DistributionMarker feed.accountant
+  (cid, marker.count, marker.weight) === (merged, 3, 3.0 * paid_distribution_weight)
+
+testMergedMarkerMergesAgain : Script ()
+testMergedMarkerMergesAgain = do
+  feed <- setup
+  (sub, [m1, m2, m3]) <- threeMarkers feed
+  merged <- submit feed.accountant $ exerciseCmd m1 DistributionMarker_Merge with
+    actor = feed.accountant, others = [m2]
+  (_, round1) <- licenseeSetup feed
+  _ <- submit feed.licensee $ distribute sub (Api.ByView round1) [feed.client]
+  [(m4, _)] <- filter (\(cid, _) -> cid /= merged && cid /= m3) <$> query @DistributionMarker feed.accountant
+  final <- submit feed.accountant $ exerciseCmd merged DistributionMarker_Merge with
+    actor = feed.accountant, others = [m3, m4]
+  [(cid, marker)] <- query @DistributionMarker feed.accountant
+  (cid, marker.count, marker.weight, marker.fromRound, marker.toRound)
+    === (final, 4, 4.0 * paid_distribution_weight, 1, 2)
+
+testMergeRefusesForeignMarkers : Script ()
+testMergeRefusesForeignMarkers = do
+  feed <- setup
+  (sub, [m1, _, _]) <- threeMarkers feed
+  -- A marker under another license of the same distributor.
+  (_, round1) <- licenseeSetup feed
+  subscription <- hourSubscription
+  other <- sublicense feed.licensee feed.rootLicense (Some subscription) []
+  _ <- submit feed.licensee $ distribute other (Api.ByView round1) [feed.consumer]
+  -- A marker of another distributor.
+  sub2 <- sublicense feed.consumer sub None []
+  derived <- submit feed.licensee $ distribute sub (Api.ByView round1) [feed.consumer]
+  _ <- submit feed.consumer $ distribute sub2 (Api.ById derived) [feed.client]
+  markers <- query @DistributionMarker feed.accountant
+  let [otherLicense] = [cid | (cid, m) <- markers, m.license == other]
+      [otherDistributor] = [cid | (cid, m) <- markers, m.distributor == feed.consumer]
+  submitMustFail feed.accountant $ exerciseCmd m1 DistributionMarker_Merge with
+    actor = feed.accountant, others = [otherLicense]
+  submitMustFail feed.accountant $ exerciseCmd m1 DistributionMarker_Merge with
+    actor = feed.accountant, others = [otherDistributor]
+  submitMustFail feed.accountant $ exerciseCmd m1 DistributionMarker_Merge with
+    actor = feed.accountant, others = []
+
+testOnlyDistributorAndAccountantsMerge : Script ()
+testOnlyDistributorAndAccountantsMerge = do
+  feed <- setup
+  (_, [m1, m2, _]) <- threeMarkers feed
+  forA_ [feed.operator, feed.consumer, feed.stranger] $ \party ->
+    submitMustFail party $ exerciseCmd m1 DistributionMarker_Merge with actor = party, others = [m2]
+
+-- | What an accountant does with a capsule obtained as a client: find the
+-- marker that names it. After a merge the naming marker is in the merge
+-- transaction's history, which Daml Script cannot read, so this covers the
+-- active one.
+testAuditFindsTheMarkerOfACapsule : Script ()
+testAuditFindsTheMarkerOfACapsule = do
+  feed <- setup
+  (sub, round1) <- licenseeSetup feed
+  -- The accountant's audit party receives a capsule like any client.
+  capsule <- submit feed.licensee $ distribute sub (Api.ByView round1) [feed.accountant]
+  _ <- submit feed.licensee $ distribute sub (Api.ByView round1) [feed.consumer]
+  Some v <- queryInterfaceContractId feed.accountant capsule
+  v.content.license === sub
+  named <- filter (\(_, m) -> m.capsule == Some capsule) <$> query @DistributionMarker feed.accountant
+  map (\(_, m) -> (m.distributor, m.license, m.fromRound)) named === [(feed.licensee, sub, 1)]
+
+testMergeRefusesDuplicatesAndItself : Script ()
+testMergeRefusesDuplicatesAndItself = do
+  feed <- setup
+  (_, [m1, m2, _]) <- threeMarkers feed
+  submitMustFail feed.accountant $ exerciseCmd m1 DistributionMarker_Merge with
+    actor = feed.accountant, others = [m2, m2]
+  submitMustFail feed.accountant $ exerciseCmd m1 DistributionMarker_Merge with
+    actor = feed.accountant, others = [m1]
+
+-- Settlement ----------------------------------------------------------------
+
+-- | The accountant's settlement sequence for `license` of the licensee.
+settlementHead : Feed -> ContractId Api.License -> Script (ContractId SettlementHead)
+settlementHead feed license = submit feed.accountant $ createCmd SettlementHead with
+  accountant = feed.accountant, distributor = feed.licensee, license, nextSequence = 1
+
+testAccountantClosesAPeriod : Script ()
+testAccountantClosesAPeriod = do
+  feed <- setup
+  (sub, [m1, m2, m3]) <- threeMarkers feed
+  head <- settlementHead feed sub
+  now <- getTime
+  settled <- submit feed.accountant $ exerciseCmd m1 DistributionMarker_Close with
+    accountant = feed.accountant, head, period = "2026-10", others = [m2, m3]
+  forA_ [feed.accountant, feed.licensee] $ \party -> do
+    [(cid, marker)] <- query @DistributionMarker party
+    cid === settled
+    marker === DistributionMarker with
+      distributor = feed.licensee, accountants = [feed.accountant], definition = feed.definition
+      license = sub, fromRound = 1, toRound = 2, count = 3, weight = 3.0 * paid_distribution_weight
+      capsule = None
+      closed = Some Closure with accountant = feed.accountant, period = "2026-10", closedAt = now
+      sequence = Some 1
+  -- The head moved past the settlement.
+  [(_, nextHead)] <- query @SettlementHead feed.accountant
+  nextHead.nextSequence === 2
+
+testSettlementIsBeyondTheDistributor : Script ()
+testSettlementIsBeyondTheDistributor = do
+  feed <- setup
+  (sub, [m1, m2, m3]) <- threeMarkers feed
+  head <- settlementHead feed sub
+  settled <- submit feed.accountant $ exerciseCmd m1 DistributionMarker_Close with
+    accountant = feed.accountant, head, period = "2026-10", others = [m2]
+  Some statement <- queryContractId feed.accountant settled
+  -- The distributor can neither archive the settlement nor mint one, and
+  -- no accountant can mint one alone either.
+  submitMustFail feed.licensee $ archiveCmd settled
+  submitMustFail feed.licensee $ createCmd statement with sequence = Some 2
+  submitMustFail feed.accountant $ createCmd statement with sequence = Some 2
+  -- Nothing merges into a settled period, and a settlement is not reopened.
+  submitMustFail feed.licensee $ exerciseCmd m3 DistributionMarker_Merge with
+    actor = feed.licensee, others = [settled]
+  submitMustFail feed.accountant $ exerciseCmd settled DistributionMarker_Merge with
+    actor = feed.accountant, others = [m3]
+  [(nextHead, _)] <- query @SettlementHead feed.accountant
+  submitMustFail feed.accountant $ exerciseCmd settled DistributionMarker_Close with
+    accountant = feed.accountant, head = nextHead, period = "2026-11", others = [m3]
+
+testOnlyAnAccountantCloses : Script ()
+testOnlyAnAccountantCloses = do
+  feed <- setup
+  (sub, [m1, m2, _]) <- threeMarkers feed
+  head <- settlementHead feed sub
+  forA_ [feed.licensee, feed.operator, feed.stranger] $ \party ->
+    submitMustFail party $ exerciseCmd m1 DistributionMarker_Close with
+      accountant = party, head, period = "2026-10", others = [m2]
+  -- A single marker closes on its own.
+  _ <- submit feed.accountant $ exerciseCmd m1 DistributionMarker_Close with
+    accountant = feed.accountant, head, period = "2026-10", others = []
+  pure ()
+
+testSettlementsAreSequencedByTheHead : Script ()
+testSettlementsAreSequencedByTheHead = do
+  feed <- setup
+  (sub, [m1, m2, m3]) <- threeMarkers feed
+  head <- settlementHead feed sub
+  first <- submit feed.accountant $ exerciseCmd m1 DistributionMarker_Close with
+    accountant = feed.accountant, head, period = "2026-10", others = []
+  -- The consumed head closes nothing more; the successor numbers the next
+  -- settlement, whatever its label.
+  submitMustFail feed.accountant $ exerciseCmd m2 DistributionMarker_Close with
+    accountant = feed.accountant, head, period = "2026-10", others = []
+  [(nextHead, _)] <- query @SettlementHead feed.accountant
+  second <- submit feed.accountant $ exerciseCmd m2 DistributionMarker_Close with
+    accountant = feed.accountant, head = nextHead, period = "2026-10", others = []
+  settlements <- query @DistributionMarker feed.accountant
+  sortOn snd [ (cid, m.sequence) | (cid, m) <- settlements, isSome m.closed ]
+    === [(first, Some 1), (second, Some 2)]
+  -- A head of another license does not number this license's settlements.
+  other <- sublicense feed.licensee feed.rootLicense None []
+  otherHead <- settlementHead feed other
+  submitMustFail feed.accountant $ exerciseCmd m3 DistributionMarker_Close with
+    accountant = feed.accountant, head = otherHead, period = "2026-10", others = []

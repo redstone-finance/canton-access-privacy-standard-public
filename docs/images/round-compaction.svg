@@ -1,0 +1,175 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="1382" viewBox="0 0 900 1382" role="img">
+<title>A RoundMerger dropping roots older than X = 24, N = 3, K = 4, a round every hour: steps 1 to 3</title>
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; dominant-baseline: central; text-anchor: middle; }
+.th { font-size: 14px; font-weight: 500; }
+.ts { font-size: 12px; }
+.step { text-anchor: start; font-size: 14px; font-weight: 500; fill: #3D0309; }
+rect { stroke-width: 0.5; }
+.merger rect { fill: #AE0822; stroke: #950017; } .merger .th { fill: #FFFFFF; } .merger .ts { fill: #FFE3E3; }
+.meta rect { fill: #FFE3E3; stroke: #E41939; } .meta .th { fill: #3D0309; } .meta .ts { fill: #AE0822; }
+.new rect { stroke-width: 2; }
+.gone rect { fill: #F7F7F7; stroke: #B4B2A9; stroke-dasharray: 3 3; } .gone text { fill: #888780; }
+.merged rect { fill: #F7F7F7; stroke: #B4B2A9; stroke-dasharray: 3 3; } .merged text { fill: #888780; }
+.entry rect { fill: #FFF6F6; stroke: #E41939; stroke-dasharray: 3 3; } .entry text { fill: #AE0822; }
+.kept rect { fill: #FFF6F6; stroke: #AE0822; stroke-width: 1; } .kept text { fill: #3D0309; }
+.ledger rect { fill: #F7F7F7; stroke: #888780; } .ledger text { fill: #444441; }
+.legend { text-anchor: start; font-size: 12px; fill: #6F6B6B; }
+.dots { font-size: 16px; fill: #6F6B6B; }
+.arr { stroke: #AE0822; stroke-width: 1.5; fill: none; }
+.data { stroke: #E41939; stroke-width: 1.2; stroke-dasharray: 2 3; fill: none; }
+.rule { stroke: #E7E7E7; stroke-width: 1; }
+</style>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#AE0822" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker><marker id="dot" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6"><circle cx="5" cy="5" r="3.5" fill="#E41939"/></marker></defs>
+<rect x="0" y="0" width="900" height="1382" fill="#FFFFFF" stroke="none"/>
+<text class="step" x="8" y="22">1. A round every hour; rounds 0 to 14 published, merge called with all of them</text>
+<g class="merger"><rect x="472" y="40" width="420" height="108" rx="8"/><text class="th" x="682" y="58">RoundMerger</text><text class="ts" x="682" y="77">N = 3, K = 4, X = 24, H = 14</text><text class="ts" x="682" y="95">metaRounds (refs): 1–9</text><text class="ts" x="682" y="113">pendingRounds (data): 10</text><text class="ts" x="682" y="131">genesis (data): 0</text></g>
+<g class="meta new"><rect x="123" y="186" width="140" height="38" rx="6"/><text class="th" x="193" y="205">1–9</text></g>
+<g class="meta new"><rect x="42" y="246" width="98" height="38" rx="6"/><text class="th" x="91" y="265">1–3</text></g>
+<g class="meta new"><rect x="144" y="246" width="98" height="38" rx="6"/><text class="th" x="193" y="265">4–6</text></g>
+<g class="meta new"><rect x="246" y="246" width="98" height="38" rx="6"/><text class="th" x="295" y="265">7–9</text></g>
+<line x1="682" y1="150" x2="193" y2="182" class="arr" marker-end="url(#arrow)"/>
+<line x1="170" y1="226" x2="91" y2="242" class="arr" marker-end="url(#arrow)"/>
+<line x1="193" y1="226" x2="193" y2="242" class="arr" marker-end="url(#arrow)"/>
+<line x1="216" y1="226" x2="295" y2="242" class="arr" marker-end="url(#arrow)"/>
+<line class="data" x1="81" y1="286" x2="57" y2="312" marker-end="url(#dot)"/>
+<line class="data" x1="91" y1="286" x2="91" y2="312" marker-end="url(#dot)"/>
+<line class="data" x1="101" y1="286" x2="125" y2="312" marker-end="url(#dot)"/>
+<line class="data" x1="183" y1="286" x2="159" y2="312" marker-end="url(#dot)"/>
+<line class="data" x1="193" y1="286" x2="193" y2="312" marker-end="url(#dot)"/>
+<line class="data" x1="203" y1="286" x2="227" y2="312" marker-end="url(#dot)"/>
+<line class="data" x1="285" y1="286" x2="261" y2="312" marker-end="url(#dot)"/>
+<line class="data" x1="295" y1="286" x2="295" y2="312" marker-end="url(#dot)"/>
+<line class="data" x1="305" y1="286" x2="329" y2="312" marker-end="url(#dot)"/>
+<path d="M892 140 L894 140 L894 304 L23 304 L23 312" class="data" marker-end="url(#dot)"/>
+<path d="M892 140 L894 140 L894 304 L363 304 L363 312" class="data" marker-end="url(#dot)"/>
+<g class="entry"><rect x="8" y="316" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="23" y="329">0</text></g>
+<g class="merged"><rect x="42" y="316" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="57" y="329">1</text></g>
+<g class="merged"><rect x="76" y="316" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="91" y="329">2</text></g>
+<g class="merged"><rect x="110" y="316" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="125" y="329">3</text></g>
+<g class="merged"><rect x="144" y="316" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="159" y="329">4</text></g>
+<g class="merged"><rect x="178" y="316" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="193" y="329">5</text></g>
+<g class="merged"><rect x="212" y="316" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="227" y="329">6</text></g>
+<g class="merged"><rect x="246" y="316" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="261" y="329">7</text></g>
+<g class="merged"><rect x="280" y="316" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="295" y="329">8</text></g>
+<g class="merged"><rect x="314" y="316" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="329" y="329">9</text></g>
+<g class="entry"><rect x="348" y="316" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="363" y="329">10</text></g>
+<g class="kept"><rect x="382" y="316" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="397" y="329">11</text></g>
+<g class="kept"><rect x="416" y="316" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="431" y="329">12</text></g>
+<g class="kept"><rect x="450" y="316" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="465" y="329">13</text></g>
+<g class="kept"><rect x="484" y="316" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="499" y="329">14</text></g>
+<text class="legend" x="830" y="205">level 2</text>
+<text class="legend" x="830" y="265">level 1</text>
+<text class="legend" x="830" y="329">level 0</text>
+<text class="legend" x="8" y="366">H − K = 10: 1–9 make a level 2 tree; 0 and 10 are entries in the merger; 11–14 kept.</text>
+<text class="legend" x="8" y="384">No round is older than X = 24 yet: nothing goes.</text>
+<line class="rule" x1="8" y1="406" x2="892" y2="406"/>
+<text class="step" x="8" y="436">2. Rounds 15 and 16 published, merge called with rounds 11 to 16</text>
+<g class="merger"><rect x="472" y="454" width="420" height="108" rx="8"/><text class="th" x="682" y="472">RoundMerger</text><text class="ts" x="682" y="491">N = 3, K = 4, X = 24, H = 16</text><text class="ts" x="682" y="509">metaRounds (refs): 1–9, 10–12</text><text class="ts" x="682" y="527">pendingRounds (data): none</text><text class="ts" x="682" y="545">genesis (data): 0</text></g>
+<g class="meta"><rect x="123" y="600" width="140" height="38" rx="6"/><text class="th" x="193" y="619">1–9</text></g>
+<g class="meta"><rect x="42" y="660" width="98" height="38" rx="6"/><text class="th" x="91" y="679">1–3</text></g>
+<g class="meta"><rect x="144" y="660" width="98" height="38" rx="6"/><text class="th" x="193" y="679">4–6</text></g>
+<g class="meta"><rect x="246" y="660" width="98" height="38" rx="6"/><text class="th" x="295" y="679">7–9</text></g>
+<g class="meta new"><rect x="348" y="660" width="98" height="38" rx="6"/><text class="th" x="397" y="679">10–12</text></g>
+<line x1="502" y1="564" x2="193" y2="596" class="arr" marker-end="url(#arrow)"/>
+<line x1="862" y1="564" x2="397" y2="656" class="arr" marker-end="url(#arrow)"/>
+<line x1="170" y1="640" x2="91" y2="656" class="arr" marker-end="url(#arrow)"/>
+<line x1="193" y1="640" x2="193" y2="656" class="arr" marker-end="url(#arrow)"/>
+<line x1="216" y1="640" x2="295" y2="656" class="arr" marker-end="url(#arrow)"/>
+<line class="data" x1="81" y1="700" x2="57" y2="726" marker-end="url(#dot)"/>
+<line class="data" x1="91" y1="700" x2="91" y2="726" marker-end="url(#dot)"/>
+<line class="data" x1="101" y1="700" x2="125" y2="726" marker-end="url(#dot)"/>
+<line class="data" x1="183" y1="700" x2="159" y2="726" marker-end="url(#dot)"/>
+<line class="data" x1="193" y1="700" x2="193" y2="726" marker-end="url(#dot)"/>
+<line class="data" x1="203" y1="700" x2="227" y2="726" marker-end="url(#dot)"/>
+<line class="data" x1="285" y1="700" x2="261" y2="726" marker-end="url(#dot)"/>
+<line class="data" x1="295" y1="700" x2="295" y2="726" marker-end="url(#dot)"/>
+<line class="data" x1="305" y1="700" x2="329" y2="726" marker-end="url(#dot)"/>
+<line class="data" x1="387" y1="700" x2="363" y2="726" marker-end="url(#dot)"/>
+<line class="data" x1="397" y1="700" x2="397" y2="726" marker-end="url(#dot)"/>
+<line class="data" x1="407" y1="700" x2="431" y2="726" marker-end="url(#dot)"/>
+<path d="M892 554 L894 554 L894 718 L23 718 L23 726" class="data" marker-end="url(#dot)"/>
+<g class="entry"><rect x="8" y="730" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="23" y="743">0</text></g>
+<g class="merged"><rect x="42" y="730" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="57" y="743">1</text></g>
+<g class="merged"><rect x="76" y="730" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="91" y="743">2</text></g>
+<g class="merged"><rect x="110" y="730" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="125" y="743">3</text></g>
+<g class="merged"><rect x="144" y="730" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="159" y="743">4</text></g>
+<g class="merged"><rect x="178" y="730" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="193" y="743">5</text></g>
+<g class="merged"><rect x="212" y="730" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="227" y="743">6</text></g>
+<g class="merged"><rect x="246" y="730" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="261" y="743">7</text></g>
+<g class="merged"><rect x="280" y="730" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="295" y="743">8</text></g>
+<g class="merged"><rect x="314" y="730" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="329" y="743">9</text></g>
+<g class="merged"><rect x="348" y="730" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="363" y="743">10</text></g>
+<g class="merged"><rect x="382" y="730" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="397" y="743">11</text></g>
+<g class="merged"><rect x="416" y="730" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="431" y="743">12</text></g>
+<g class="kept"><rect x="450" y="730" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="465" y="743">13</text></g>
+<g class="kept"><rect x="484" y="730" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="499" y="743">14</text></g>
+<g class="kept"><rect x="518" y="730" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="533" y="743">15</text></g>
+<g class="kept"><rect x="552" y="730" width="30" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="567" y="743">16</text></g>
+<text class="legend" x="830" y="619">level 2</text>
+<text class="legend" x="830" y="679">level 1</text>
+<text class="legend" x="830" y="743">level 0</text>
+<text class="legend" x="8" y="780">H − K = 12: 11 and 12 complete block 10–12 with the entry of 10; 13–16 kept.</text>
+<text class="legend" x="8" y="798">No round is older than X = 24 yet: nothing goes.</text>
+<line class="rule" x1="8" y1="820" x2="892" y2="820"/>
+<text class="step" x="8" y="850">3. Rounds 17 to 116 published, merge called with rounds 13 to 100</text>
+<g class="merger"><rect x="472" y="868" width="420" height="108" rx="8"/><text class="th" x="682" y="886">RoundMerger</text><text class="ts" x="682" y="905">N = 3, K = 4, X = 24, H = 116</text><text class="ts" x="682" y="923">metaRounds (refs): 91–99</text><text class="ts" x="682" y="941">pendingRounds (data): 100</text><text class="ts" x="682" y="959">genesis (data): 0</text></g>
+<g class="gone"><rect x="70" y="1014" width="60" height="38" rx="6"/><text class="th" x="100" y="1033">1–9</text></g>
+<g class="gone"><rect x="42" y="1074" width="44" height="38" rx="6"/><text class="th" x="64" y="1093">1–3</text></g>
+<g class="gone"><rect x="110" y="1074" width="50" height="38" rx="6"/><text class="th" x="135" y="1093">10–12</text></g>
+<g class="meta new"><rect x="182" y="1014" width="248" height="38" rx="6"/><text class="th" x="306" y="1033">91–99</text></g>
+<g class="meta new"><rect x="182" y="1074" width="80" height="38" rx="6"/><text class="th" x="222" y="1093">91–93</text></g>
+<g class="meta new"><rect x="266" y="1074" width="80" height="38" rx="6"/><text class="th" x="306" y="1093">94–96</text></g>
+<g class="meta new"><rect x="350" y="1074" width="80" height="38" rx="6"/><text class="th" x="390" y="1093">97–99</text></g>
+<text class="dots" x="98" y="1093">…</text>
+<line x1="682" y1="978" x2="306" y2="1010" class="arr" marker-end="url(#arrow)"/>
+<line x1="265" y1="1054" x2="222" y2="1070" class="arr" marker-end="url(#arrow)"/>
+<line x1="306" y1="1054" x2="306" y2="1070" class="arr" marker-end="url(#arrow)"/>
+<line x1="347" y1="1054" x2="390" y2="1070" class="arr" marker-end="url(#arrow)"/>
+<line class="data" x1="212" y1="1114" x2="194" y2="1140" marker-end="url(#dot)"/>
+<line class="data" x1="222" y1="1114" x2="222" y2="1140" marker-end="url(#dot)"/>
+<line class="data" x1="232" y1="1114" x2="250" y2="1140" marker-end="url(#dot)"/>
+<line class="data" x1="296" y1="1114" x2="278" y2="1140" marker-end="url(#dot)"/>
+<line class="data" x1="306" y1="1114" x2="306" y2="1140" marker-end="url(#dot)"/>
+<line class="data" x1="316" y1="1114" x2="334" y2="1140" marker-end="url(#dot)"/>
+<line class="data" x1="380" y1="1114" x2="362" y2="1140" marker-end="url(#dot)"/>
+<line class="data" x1="390" y1="1114" x2="390" y2="1140" marker-end="url(#dot)"/>
+<line class="data" x1="400" y1="1114" x2="418" y2="1140" marker-end="url(#dot)"/>
+<path d="M892 968 L894 968 L894 1132 L20 1132 L20 1140" class="data" marker-end="url(#dot)"/>
+<path d="M892 968 L894 968 L894 1132 L456 1132 L456 1140" class="data" marker-end="url(#dot)"/>
+<text class="dots" x="107" y="1157">…</text>
+<text class="dots" x="516" y="1157">…</text>
+<g class="entry"><rect x="8" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="20" y="1157">0</text></g>
+<g class="merged"><rect x="42" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="54" y="1157">1</text></g>
+<g class="merged"><rect x="144" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="156" y="1157">90</text></g>
+<g class="merged"><rect x="182" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="194" y="1157">91</text></g>
+<g class="merged"><rect x="210" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="222" y="1157">92</text></g>
+<g class="merged"><rect x="238" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="250" y="1157">93</text></g>
+<g class="merged"><rect x="266" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="278" y="1157">94</text></g>
+<g class="merged"><rect x="294" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="306" y="1157">95</text></g>
+<g class="merged"><rect x="322" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="334" y="1157">96</text></g>
+<g class="merged"><rect x="350" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="362" y="1157">97</text></g>
+<g class="merged"><rect x="378" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="390" y="1157">98</text></g>
+<g class="merged"><rect x="406" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 12px" x="418" y="1157">99</text></g>
+<g class="entry"><rect x="444" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 11px" x="456" y="1157">100</text></g>
+<g class="ledger"><rect x="476" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 11px" x="488" y="1157">101</text></g>
+<g class="ledger"><rect x="528" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 11px" x="540" y="1157">112</text></g>
+<g class="kept"><rect x="560" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 11px" x="572" y="1157">113</text></g>
+<g class="kept"><rect x="588" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 11px" x="600" y="1157">114</text></g>
+<g class="kept"><rect x="616" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 11px" x="628" y="1157">115</text></g>
+<g class="kept"><rect x="644" y="1144" width="24" height="26" rx="5"/><text class="ts" style="font-size: 11px" x="656" y="1157">116</text></g>
+<text class="legend" x="830" y="1033">level 2</text>
+<text class="legend" x="830" y="1093">level 1</text>
+<text class="legend" x="830" y="1157">level 0</text>
+<text class="legend" x="8" y="1194">H − X = 116 − 24 = 92: trees 1–81 and 82–90 end before round 92, so they go; 91–99 stays.</text>
+<text class="legend" x="8" y="1212">They are archived with everything below them: 1–9, its blocks, 10–12 and all this call made.</text>
+<text class="legend" x="8" y="1230">100 waits; 101–112 on the ledger, not given; 113–116 kept.</text>
+<line class="rule" x1="8" y1="1252" x2="892" y2="1252"/>
+<text class="legend" x="8" y="1274">Round n is published at hour n. A parent needs all N children. metaRounds keys each by the first and last round it covers.</text>
+<text class="legend" x="8" y="1292">A root goes, archived with everything below it, once its last round is older than H − X. Genesis 0 always stays.</text>
+<line x1="8" y1="1316" x2="40" y2="1316" class="arr" marker-end="url(#arrow)"/>
+<text class="legend" x="50" y="1316">reference: a contract id of another contract</text>
+<line x1="8" y1="1338" x2="40" y2="1338" class="data" marker-end="url(#dot)"/>
+<text class="legend" x="50" y="1338">data held in place: the hash and fixing time of each round it points at</text>
+<text class="legend" x="8" y="1360">Dashed gray: archived; red dashed: entries in the merger; thick: made by this call. …: the ones between.</text>
+</svg>

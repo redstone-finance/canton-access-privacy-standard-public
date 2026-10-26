@@ -1,0 +1,292 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Tests of the Data Standard verifier: envelopes signed in the script by
+-- three generated node keys, every rejection path, the round and freshness
+-- checks, and the full data path of the reference implementation with this
+-- verifier as the definition's canonical one.
+module Test.DataStandardVerifierTest where
+
+import DA.Assert ((===))
+import DA.Date (Month(Oct), date)
+import qualified DA.TextMap as TM
+import DA.Time (addRelTime, hours, minutes, seconds, time)
+import Daml.Script
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.Core.DataDefinition
+import Caps.Core.License (License(..))
+import Caps.Verifier.DataStandard
+import Caps.Verifier.DataStandard.Internal.Verification (envelope)
+import DataStandard.Codecs.Envelope (hashSignedDataPoint)
+import DataStandard.DataPointV1 (PublishedDataPointView(..))
+import DataStandard.Utils (AnyValue(..), emptyMetadata)
+
+-- Fixture -------------------------------------------------------------------
+
+fixingTime : Time
+fixingTime = time (date 2026 Oct 1) 12 0 0
+
+-- | The signed replay bound: half an hour after the fixing.
+expiresAt : Time
+expiresAt = addRelTime fixingTime (minutes 30)
+
+medianValues : TM.TextMap AnyValue
+medianValues = TM.fromList [("BTC", AVDecimal 50000.12345678), ("ETH", AVDecimal 3000.1)]
+
+data Feed = Feed with
+    operator : Party
+    auditor : Party
+    reader : Party
+    licensee : Party
+    client : Party
+    keys : [Secp256k1KeyPair]
+      -- ^ Three node keys generated for the test.
+    verifier : ContractId Api.Verifier
+    definition : ContractId Api.DataDefinition
+    head : ContractId Api.RoundHead
+    rootLicense : ContractId Api.License
+
+-- | A feed whose canonical verifier is a `DataStandardVerifier` over three
+-- generated node keys with a 2-of-3 threshold and a one-hour window. The
+-- ledger clock is set a minute before the fixing time, so the genesis round
+-- precedes it.
+setup : Script Feed
+setup = do
+  setTime (addRelTime fixingTime (negate (minutes 1)))
+  operator <- allocateParty "Operator"
+  auditor <- allocateParty "Auditor"
+  reader <- allocateParty "Reader"
+  licensee <- allocateParty "Licensee"
+  client <- allocateParty "Client"
+  keys <- forA [1, 2, 3] $ const secp256k1generatekeypair
+
+  verifierCid <- submit operator $ createCmd DataStandardVerifier with
+    owner = operator, observers = [reader, licensee]
+    signers = map (.publicKey) keys, signerCountThreshold = 2
+    maxBehind = hours 1, maxAhead = minutes 5
+  let verifier = toInterfaceContractId @Api.Verifier verifierCid
+
+  proposal <- submit operator $ createCmd DefinitionProposal with
+    dataId = "BTC,ETH", operator, auditors = [auditor], readers = [reader, licensee], verifier
+    publishers = None, accepted = []
+  accepted <- submit auditor $ exerciseCmd proposal DefinitionProposal_Accept with auditor
+  (definitionCid, headCid) <- submit operator $ exerciseCmd accepted DefinitionProposal_Finalize
+  let definition = toInterfaceContractId @Api.DataDefinition definitionCid
+      head = toInterfaceContractId @Api.RoundHead headCid
+
+  rootLicenseCid <- submit operator $ createCmd License with
+    definition, owner = operator, licensor = operator, operator
+    licensees = [licensee], licenseType = AVText "root", validUntil = None
+    delegate = None
+  let rootLicense = toInterfaceContractId @Api.License rootLicenseCid
+  pure Feed with ..
+
+dataPoint : Party -> Time -> TM.TextMap AnyValue -> PublishedDataPointView
+dataPoint distributor publishedAt vs = PublishedDataPointView with
+  distributor, publishedAt, schemaVersion = "caps-1", values = vs, metadata = emptyMetadata
+
+-- | A payload: `expiresAt` and the given signatures.
+payload : Time -> [Text] -> AnyValue
+payload expiry signatures = AVMap $ TM.fromList
+  [ ("expiresAt", AVTime expiry), ("signatures", AVList $ map AVText signatures) ]
+
+-- | Content whose envelope (the data point plus `expiry`) is signed by
+-- `signers`.
+signedContent : Feed -> PublishedDataPointView -> Time -> [Secp256k1KeyPair] -> Script Api.CapsuleContent
+signedContent feed dp expiry signers = do
+  let unsigned = Api.CapsuleContent with dataPoint = dp, payload = AVText "", license = feed.rootLicense
+      rootHash = (hashSignedDataPoint $ envelope unsigned expiry).value
+  signatures <- forA signers $ \key -> secp256k1sign key.privateKey rootHash
+  pure unsigned with payload = payload expiry signatures
+
+-- | The canonical content: the fixture's data point signed by all three keys.
+content : Feed -> Script Api.CapsuleContent
+content feed = signedContent feed (dataPoint feed.operator fixingTime medianValues) expiresAt feed.keys
+
+-- | The commitment the verifier reports for `content`.
+expectedDataHash : Feed -> Api.CapsuleContent -> Text
+expectedDataHash _ c = (hashSignedDataPoint $ envelope c expiresAt).value
+
+capsule : Feed -> Api.CapsuleContent -> Api.CapsuleView
+capsule feed c = Api.CapsuleView with definition = feed.definition, roundNumber = 1, content = c
+
+-- | A consumer's own verifier instance and the outcome of verifying `c`
+-- through it.
+verifyAsClient : Feed -> Api.CapsuleContent -> Script (ContractId Api.Verifier, Api.VerificationResult)
+verifyAsClient feed c = do
+  own <- submit feed.client $ createCmd DataStandardVerifier with
+    owner = feed.client, observers = []
+    signers = map (.publicKey) feed.keys, signerCountThreshold = 2
+    maxBehind = hours 1, maxAhead = minutes 5
+  let ownVerifier = toInterfaceContractId @Api.Verifier own
+  result <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_Verify with
+    actor = feed.client, capsule = capsule feed c
+  pure (ownVerifier, result)
+
+-- Verifier ------------------------------------------------------------------
+
+testVerifiesFullQuorum : Script ()
+testVerifiesFullQuorum = do
+  feed <- setup
+  c <- content feed
+  (ownVerifier, result) <- verifyAsClient feed c
+  result === Api.Verified (expectedDataHash feed c)
+  canonical <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+    actor = feed.client, capsule = capsule feed c
+    round = Api.RoundView with
+      definition = feed.definition, roundNumber = 1
+      timestamp = fixingTime, dataHash = expectedDataHash feed c
+  canonical === Api.Passed
+
+testVerifiesAtThreshold : Script ()
+testVerifiesAtThreshold = do
+  feed <- setup
+  c <- signedContent feed (dataPoint feed.operator fixingTime medianValues) expiresAt (take 2 feed.keys)
+  (_, result) <- verifyAsClient feed c
+  result === Api.Verified (expectedDataHash feed c)
+
+testRejectsBelowThreshold : Script ()
+testRejectsBelowThreshold = do
+  feed <- setup
+  c <- signedContent feed (dataPoint feed.operator fixingTime medianValues) expiresAt (take 1 feed.keys)
+  (_, result) <- verifyAsClient feed c
+  result === Api.Rejected ["signer quorum not reached: 1 of 2"]
+
+testRejectsForeignSignature : Script ()
+testRejectsForeignSignature = do
+  feed <- setup
+  foreign <- secp256k1generatekeypair
+  c <- signedContent feed (dataPoint feed.operator fixingTime medianValues) expiresAt (take 1 feed.keys ++ [foreign])
+  (_, result) <- verifyAsClient feed c
+  result === Api.Rejected ["signature 2 matches no signer", "signer quorum not reached: 1 of 2"]
+
+testRejectsDuplicateSigner : Script ()
+testRejectsDuplicateSigner = do
+  feed <- setup
+  -- The same node signing twice counts once.
+  c <- signedContent feed (dataPoint feed.operator fixingTime medianValues) expiresAt (take 1 feed.keys ++ take 1 feed.keys)
+  (_, result) <- verifyAsClient feed c
+  result === Api.Rejected ["signer quorum not reached: 1 of 2"]
+
+testRejectsTamperedValues : Script ()
+testRejectsTamperedValues = do
+  feed <- setup
+  c <- content feed
+  let tampered = c with dataPoint = dataPoint feed.operator fixingTime (TM.insert "BTC" (AVDecimal 50000.5) medianValues)
+  (_, result) <- verifyAsClient feed tampered
+  result === Api.Rejected
+    [ "signature 1 matches no signer", "signature 2 matches no signer", "signature 3 matches no signer"
+    , "signer quorum not reached: 0 of 2" ]
+
+testRejectsWrongFixingTime : Script ()
+testRejectsWrongFixingTime = do
+  feed <- setup
+  c <- content feed
+  -- The fixing time is signed: a data point re-presented a second later is
+  -- not the signed one.
+  let shifted = c with dataPoint = dataPoint feed.operator (addRelTime fixingTime (seconds 1)) medianValues
+  (_, result) <- verifyAsClient feed shifted
+  result === Api.Rejected
+    [ "signature 1 matches no signer", "signature 2 matches no signer", "signature 3 matches no signer"
+    , "signer quorum not reached: 0 of 2" ]
+
+testRejectsWrongSchema : Script ()
+testRejectsWrongSchema = do
+  feed <- setup
+  c <- content feed
+  let reschemed = c with dataPoint = c.dataPoint with schemaVersion = "caps-2"
+  (_, result) <- verifyAsClient feed reschemed
+  case result of
+    Api.Rejected (_ :: _) -> pure ()
+    other -> fail $ "expected a rejection, got " <> show other
+
+testRejectsPublishedAfterExpiry : Script ()
+testRejectsPublishedAfterExpiry = do
+  feed <- setup
+  c <- signedContent feed (dataPoint feed.operator fixingTime medianValues) (addRelTime fixingTime (negate (seconds 1))) feed.keys
+  (_, result) <- verifyAsClient feed c
+  result === Api.Rejected ["published after expiry"]
+
+testRejectsMalformedPayload : Script ()
+testRejectsMalformedPayload = do
+  feed <- setup
+  c <- content feed
+  let reason = "payload must be a map of expiresAt (time) and signatures (list of text)"
+  (ownVerifier, notAMap) <- verifyAsClient feed c with payload = AVText "0x"
+  notAMap === Api.Rejected [reason]
+  (_, noExpiry) <- verifyAsClient feed c with payload = AVMap (TM.fromList [("signatures", AVList [])])
+  noExpiry === Api.Rejected [reason]
+  round <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+    actor = feed.client, capsule = capsule feed c with payload = AVText "0x"
+    round = Api.RoundView with
+      definition = feed.definition, roundNumber = 1, timestamp = fixingTime, dataHash = ""
+  round === Api.Failed [reason]
+
+testRejectsWrongRound : Script ()
+testRejectsWrongRound = do
+  feed <- setup
+  c <- content feed
+  (ownVerifier, _) <- verifyAsClient feed c
+  let roundWith number timestamp dataHash = Api.RoundView with
+        definition = feed.definition, roundNumber = number, timestamp, dataHash
+      check round = submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+        actor = feed.client, capsule = capsule feed c, round
+  wrongNumber <- check $ roundWith 2 fixingTime (expectedDataHash feed c)
+  wrongNumber === Api.Failed ["round number mismatch"]
+  wrongTime <- check $ roundWith 1 (addRelTime fixingTime (seconds 1)) (expectedDataHash feed c)
+  wrongTime === Api.Failed ["round timestamp differs from the fixing time"]
+  wrongHash <- check $ roundWith 1 fixingTime "00"
+  wrongHash === Api.Failed ["round commitment mismatch"]
+
+testFreshness : Script ()
+testFreshness = do
+  feed <- setup
+  c <- content feed
+  (ownVerifier, _) <- verifyAsClient feed c
+  let freshnessAt asOf = submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyFreshness with
+        actor = feed.client, capsule = capsule feed c, asOf
+  fresh <- freshnessAt $ addRelTime fixingTime (minutes 10)
+  fresh === Api.Passed
+  -- Within the window but past the signed replay bound.
+  expired <- freshnessAt $ addRelTime fixingTime (minutes 45)
+  expired === Api.Failed ["payload expired"]
+  stale <- freshnessAt $ addRelTime fixingTime (hours 2)
+  stale === Api.Failed ["fixing time too far in the past", "payload expired"]
+  early <- freshnessAt $ addRelTime fixingTime (negate (minutes 10))
+  early === Api.Failed ["fixing time too far in the future"]
+
+-- Data path -----------------------------------------------------------------
+
+testPublishAndDistributeRound : Script ()
+testPublishAndDistributeRound = do
+  feed <- setup
+  c <- content feed
+  setTime (addRelTime fixingTime (seconds 10))
+  result <- submit feed.licensee $ exerciseCmd feed.head Api.RoundHead_CreateRound with
+    actor = feed.licensee, content = c
+  Some roundView <- queryInterfaceContractId feed.reader result.round
+  roundView.roundNumber === 1
+  roundView.timestamp === fixingTime
+  roundView.dataHash === expectedDataHash feed c
+
+  -- Values nobody signed cannot become a round.
+  later <- signedContent feed (dataPoint feed.operator (addRelTime fixingTime (seconds 5)) medianValues) expiresAt feed.keys
+  submitMustFail feed.licensee $ exerciseCmd result.head Api.RoundHead_CreateRound with
+    actor = feed.licensee
+    content = later with dataPoint = dataPoint feed.operator (addRelTime fixingTime (seconds 5)) (TM.insert "BTC" (AVDecimal 1.0) medianValues)
+
+  -- The licensee distributes the root capsule; the client verifies it on
+  -- its own verifier against the round it reads.
+  Some rootView <- queryInterfaceContractId feed.licensee result.capsule
+  sublicense <- submit feed.licensee $
+    exerciseCmd feed.rootLicense Api.License_CreateSublicense with
+      actor = feed.licensee, licenseType = AVText "redistribution", licensees = []
+  distributed <- submit feed.licensee $ exerciseCmd sublicense Api.License_Distribute with
+    source = Api.ByView rootView, clients = [feed.client]
+  Some distributedView <- queryInterfaceContractId feed.client distributed
+  (ownVerifier, verified) <- verifyAsClient feed distributedView.content
+  verified === Api.Verified (expectedDataHash feed c)
+  canonical <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+    actor = feed.client, capsule = distributedView, round = roundView
+  canonical === Api.Passed

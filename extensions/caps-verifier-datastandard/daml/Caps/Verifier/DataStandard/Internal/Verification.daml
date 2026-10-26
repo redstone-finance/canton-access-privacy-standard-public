@@ -1,0 +1,109 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | The checks behind `DataStandardVerifier`, as functions over views. Every
+-- failed check is reported as a `Rejected` or `Failed` reason.
+module Caps.Verifier.DataStandard.Internal.Verification
+  ( verifyContent
+  , verifyRound
+  , verifyFreshness
+  , commitment
+  , envelope
+  ) where
+
+import DA.List (dedup, findIndex)
+import DA.Optional (catOptionals)
+import qualified DA.TextMap as TM
+import DA.Time (RelTime, addRelTime)
+
+import qualified Caps.Api.CoreV1 as Api
+import DataStandard.Codecs.Envelope (hashSignedDataPoint)
+import DataStandard.Codecs.Verify (verifyDataPointWith)
+import DataStandard.Utils (AnyValue(..), SignedDataPoint(..))
+
+-- | Authenticity: `Verified` with the round commitment when the payload is
+-- well formed and carries signatures of at least `signerCountThreshold`
+-- distinct `signers` over the capsule's data point; `Rejected` with every
+-- failed check otherwise.
+verifyContent : [Text] -> Int -> Api.CapsuleContent -> Api.VerificationResult
+verifyContent signers signerCountThreshold content = case payload content of
+  Left reason -> Api.Rejected [reason]
+  Right (expiresAt, signatures)
+    | signed.publishedAt > expiresAt -> Api.Rejected ["published after expiry"]
+    | null failed -> Api.Verified (hashSignedDataPoint signed).value
+    | otherwise -> Api.Rejected failed
+    where
+      signed = envelope content expiresAt
+      -- Checked at the fixing time itself, so that only the signature is
+      -- judged and never the payload's age: that is `verifyFreshness`.
+      verifies signature key = either (const False) (const True) $
+        verifyDataPointWith content.dataPoint.distributor key signed.publishedAt signed signature
+      matched = [ findIndex (verifies signature) signers | signature <- signatures ]
+      distinct = dedup $ catOptionals matched
+      failed =
+        [ "signature " <> show i <> " matches no signer"
+        | (i, None) <- zip [1..length signatures] matched ]
+        <> [ "signer quorum not reached: " <> show (length distinct) <> " of " <> show signerCountThreshold
+           | length distinct < signerCountThreshold ]
+
+-- | Canonicality: the round is this capsule's, at its fixing time, and
+-- commits to its content.
+verifyRound : Api.CapsuleView -> Api.RoundView -> Api.CheckResult
+verifyRound capsule round = case commitment capsule.content of
+  Left reason -> Api.Failed [reason]
+  Right dataHash -> outcome
+    [ ("round belongs to another definition", round.definition == capsule.definition)
+    , ("round number mismatch", round.roundNumber == capsule.roundNumber)
+    , ("round timestamp differs from the fixing time", round.timestamp == capsule.content.dataPoint.publishedAt)
+    , ("round commitment mismatch", round.dataHash == dataHash)
+    ]
+
+-- | Freshness: the fixing time lies within `maxBehind` before and `maxAhead`
+-- after the reference time, and the signed `expiresAt` has not passed.
+verifyFreshness : RelTime -> RelTime -> Api.CapsuleView -> Time -> Api.CheckResult
+verifyFreshness maxBehind maxAhead capsule asOf = case payload capsule.content of
+  Left reason -> Api.Failed [reason]
+  Right (expiresAt, _) -> outcome
+    [ ("fixing time too far in the past", fixingTime >= addRelTime asOf (negate maxBehind))
+    , ("fixing time too far in the future", fixingTime <= addRelTime asOf maxAhead)
+    , ("payload expired", asOf <= expiresAt)
+    ]
+  where
+    fixingTime = capsule.content.dataPoint.publishedAt
+
+-- | The round commitment: the structural root hash of the signed envelope,
+-- the Data Standard's `canonicalHash`. Left when the payload is not well
+-- formed, since the envelope needs its `expiresAt`.
+commitment : Api.CapsuleContent -> Either Api.RejectionReason Text
+commitment content = do
+  (expiresAt, _) <- payload content
+  pure (hashSignedDataPoint $ envelope content expiresAt).value
+
+-- | The signed envelope a capsule stands for: the data point's fixing time,
+-- schema version and values, with the payload's `expiresAt`.
+envelope : Api.CapsuleContent -> Time -> SignedDataPoint
+envelope content expiresAt = SignedDataPoint with
+  publishedAt = content.dataPoint.publishedAt
+  expiresAt
+  schemaVersion = content.dataPoint.schemaVersion
+  values = content.dataPoint.values
+
+-- | The payload's two fields, or why it is not a Data Standard payload.
+payload : Api.CapsuleContent -> Either Api.RejectionReason (Time, [Text])
+payload content = case content.payload of
+  AVMap fields
+    | Some (AVTime expiresAt) <- TM.lookup "expiresAt" fields
+    , Some (AVList items) <- TM.lookup "signatures" fields
+    , Some signatures <- mapA text items
+    -> Right (expiresAt, signatures)
+  _ -> Left "payload must be a map of expiresAt (time) and signatures (list of text)"
+  where
+    text (AVText t) = Some t
+    text _ = None
+
+-- | `Passed` when every check holds, otherwise the reasons of the failed
+-- ones, in order.
+outcome : [(Api.RejectionReason, Bool)] -> Api.CheckResult
+outcome checks = case [ reason | (reason, ok) <- checks, not ok ] of
+  [] -> Api.Passed
+  failed -> Api.Failed failed

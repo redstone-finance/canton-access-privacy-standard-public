@@ -1,0 +1,186 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Tests of the round archiver on rounds published through the reference
+-- implementation with the test verifier: the newest rounds stay, an older
+-- round waits out its keep period, the genesis round always stays, the round
+-- head and the rounds must be the archiver's definition's, and an actor other
+-- than the operator cannot archive, not even with the archiver disclosed.
+module Test.RoundArchiverTest where
+
+import DA.Assert ((===))
+import DA.Optional (isSome)
+import qualified DA.TextMap as TM
+import DA.Time (hours, minutes)
+import Daml.Script
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.Core.DataDefinition
+import Caps.Core.License (License(..))
+import Caps.RoundArchiver
+import Caps.Test.Fixtures.TestVerifier
+import DataStandard.DataPointV1 (PublishedDataPointView(..))
+import DataStandard.Utils (AnyValue(..), emptyMetadata)
+
+-- Fixture -------------------------------------------------------------------
+
+data Feed = Feed with
+    operator : Party
+    licensee : Party
+    definition : ContractId Api.DataDefinition
+    otherDefinition : ContractId Api.DataDefinition
+      -- ^ A second definition of the same operator.
+    head : ContractId Api.RoundHead
+      -- ^ The head after round 3.
+    rounds : [ContractId Api.Round]
+      -- ^ Rounds 0 to 3, the genesis round first, a minute apart.
+    otherRound : ContractId Api.Round
+      -- ^ Round 1 of the second definition.
+
+nodesTag : Text
+nodesTag = "signed-by-nodes"
+
+-- | The archiver's K.
+keptRoundCount : Int
+keptRoundCount = 2
+
+-- | Three rounds after the genesis round, a minute apart; the ledger clock
+-- stops at the third. The licensee reads the feed, so it sees the head and
+-- the rounds.
+setup : Script Feed
+setup = do
+  operator <- allocateParty "Operator"
+  auditor <- allocateParty "Auditor"
+  licensee <- allocateParty "Licensee"
+
+  verifierCid <- submit operator $ createCmd TestVerifier with
+    owner = operator, acceptedTag = nodesTag, observers = [licensee]
+    maxBehind = hours 1, maxAhead = minutes 5
+  let bootstrap dataId = do
+        proposal <- submit operator $ createCmd DefinitionProposal with
+          dataId, operator, auditors = [auditor], readers = [licensee]
+          verifier = toInterfaceContractId verifierCid, publishers = None, accepted = []
+        accepted <- submit auditor $ exerciseCmd proposal DefinitionProposal_Accept with auditor
+        submit operator $ exerciseCmd accepted DefinitionProposal_Finalize
+      rootLicense definition = toInterfaceContractId @Api.License <$> submit operator do
+        createCmd License with
+          definition, owner = operator, licensor = operator
+          operator, licensees = [licensee], licenseType = AVText "root", validUntil = None
+          delegate = None
+  (definitionCid, headCid) <- bootstrap "BTC/USD"
+  (otherDefinitionCid, otherHeadCid) <- bootstrap "ETH/USD"
+  let definition = toInterfaceContractId @Api.DataDefinition definitionCid
+      otherDefinition = toInterfaceContractId @Api.DataDefinition otherDefinitionCid
+      genesisHead = toInterfaceContractId @Api.RoundHead headCid
+  license <- rootLicense definition
+  otherLicense <- rootLicense otherDefinition
+  Some genesis <- queryInterfaceContractId operator genesisHead
+
+  other <- publishNext operator otherLicense (toInterfaceContractId @Api.RoundHead otherHeadCid)
+  first <- publishNext operator license genesisHead
+  second <- publishNext operator license first.head
+  third <- publishNext operator license second.head
+  pure Feed with
+    operator, licensee, definition, otherDefinition
+    head = third.head
+    rounds = genesis.round :: map (.round) [first, second, third]
+    otherRound = other.round
+
+-- | Publish the next round a minute after the previous one, as the operator.
+publishNext operator license head = do
+  passTime (minutes 1)
+  now <- getTime
+  submit operator $ exerciseCmd head Api.RoundHead_CreateRound with
+    actor = operator
+    content = Api.CapsuleContent with
+      dataPoint = PublishedDataPointView with
+        distributor = operator, publishedAt = now, schemaVersion = "quote-1"
+        values = TM.fromList [("price", AVDecimal 50000.0)], metadata = emptyMetadata
+      payload = AVText nodesTag
+      license
+
+-- | The operator's archiver for `definition`, keeping the 2 newest rounds,
+-- and an older round for `keepPeriod` after its fixing time.
+createArchiver feed definition keepPeriod = submit feed.operator $ createCmd RoundArchiver with
+  operator = feed.operator, definition, keptRounds = keptRoundCount, keepPeriod
+
+-- | Archive `rounds` as `actor` against the feed's head.
+archiveAs feed actor archiver rounds = exerciseCmd archiver RoundArchiver_Archive with
+  actor, roundHead = feed.head, rounds
+
+-- | Whether the operator still sees each of the feed's rounds.
+active feed = mapA (fmap isSome . queryInterfaceContractId feed.operator) feed.rounds
+
+-- Archiving -----------------------------------------------------------------
+
+testKeepsTheNewestRounds : Script ()
+testKeepsTheNewestRounds = do
+  feed <- setup
+  archiver <- createArchiver feed feed.definition (minutes 1)
+  -- Two minutes on, every round is past the keep period; rounds 2 and 3
+  -- stay only as the 2 newest, round 1 goes.
+  passTime (minutes 2)
+  archived <- submit feed.operator $ archiveAs feed feed.operator archiver (drop 1 feed.rounds)
+  archived === take 1 (drop 1 feed.rounds)
+  remaining <- active feed
+  remaining === [True, False, True, True]
+
+testKeepsTheGenesisRound : Script ()
+testKeepsTheGenesisRound = do
+  feed <- setup
+  archiver <- createArchiver feed feed.definition (minutes 1)
+  -- Round 0 is three rounds behind round 3 and three minutes old, but the
+  -- genesis round always stays.
+  archived <- submit feed.operator $ archiveAs feed feed.operator archiver (take 1 feed.rounds)
+  archived === []
+  remaining <- active feed
+  remaining === [True, True, True, True]
+
+testWaitsOutTheKeepPeriod : Script ()
+testWaitsOutTheKeepPeriod = do
+  feed <- setup
+  archiver <- createArchiver feed feed.definition (minutes 3)
+  -- Round 1 is two minutes old, within a three-minute keep period.
+  kept <- submit feed.operator $ archiveAs feed feed.operator archiver (drop 1 feed.rounds)
+  kept === []
+  passTime (minutes 2)
+  archived <- submit feed.operator $ archiveAs feed feed.operator archiver (drop 1 feed.rounds)
+  archived === take 1 (drop 1 feed.rounds)
+
+testRefusesNoKeptRounds : Script ()
+testRefusesNoKeptRounds = do
+  feed <- setup
+  -- Keeping no round would let the head's own round go.
+  submitMustFail feed.operator $ createCmd RoundArchiver with
+    operator = feed.operator, definition = feed.definition, keptRounds = 0, keepPeriod = minutes 1
+
+testRejectsAnotherDefinitionsHead : Script ()
+testRejectsAnotherDefinitionsHead = do
+  feed <- setup
+  -- An archiver of the second definition refuses the first one's head.
+  archiver <- createArchiver feed feed.otherDefinition (minutes 1)
+  submitMustFail feed.operator $ archiveAs feed feed.operator archiver feed.rounds
+  remaining <- active feed
+  remaining === [True, True, True, True]
+
+testRejectsAnotherDefinitionsRound : Script ()
+testRejectsAnotherDefinitionsRound = do
+  feed <- setup
+  archiver <- createArchiver feed feed.definition (minutes 1)
+  -- A round of the second definition among the first one's fails the whole
+  -- archive, the stale round 1 included.
+  submitMustFail feed.operator $ archiveAs feed feed.operator archiver (feed.otherRound :: feed.rounds)
+  remaining <- active feed
+  remaining === [True, True, True, True]
+
+testOnlyTheOperatorArchives : Script ()
+testOnlyTheOperatorArchives = do
+  feed <- setup
+  archiver <- createArchiver feed feed.definition (minutes 1)
+  -- The licensee sees the head and the rounds; with the archiver disclosed
+  -- it still cannot archive, since a round admits only the operator.
+  Some archiverDisclosure <- queryDisclosure feed.operator archiver
+  submitMustFail (actAs feed.licensee <> disclose archiverDisclosure) $
+    archiveAs feed feed.licensee archiver feed.rounds
+  remaining <- active feed
+  remaining === [True, True, True, True]

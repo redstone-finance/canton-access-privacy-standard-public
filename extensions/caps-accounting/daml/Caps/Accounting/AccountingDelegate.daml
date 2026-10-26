@@ -1,0 +1,76 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | The reference accounting as a `LicenseDelegate`: a license that names an
+-- `AccountingDelegate` leaves a `DistributionMarker` for its accountants on
+-- every distribution its owner reports, at the weight the license passes
+-- under `weight` in the context map, or at `default_weight` when the
+-- license passes no context at all. Signed by the owner alone, so no
+-- accountant's participant is needed for a distribution. A sublicense's
+-- delegate is created by its parent's, with the same accountants.
+module Caps.Accounting.AccountingDelegate where
+
+import DA.Action (void)
+import qualified DA.TextMap as TM
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.Accounting.DistributionMarker
+import DataStandard.Utils (AnyValue(..))
+
+template AccountingDelegate
+  with
+    owner : Party
+      -- ^ The only distributor whose reports this delegate accepts, and the
+      -- only licensor it subdelegates for.
+    accountants : [Party]
+      -- ^ The parties every marker is reported to; they observe the delegate.
+    licensees : [Party]
+      -- ^ Parties that may create a sublicense through this delegate.
+    definition : ContractId Api.DataDefinition
+      -- ^ The data definition every marker names, inherited by the delegates
+      -- of sublicenses.
+  where
+    signatory owner
+    observer licensees, accountants
+
+    interface instance Api.LicenseDelegate for AccountingDelegate where
+      view = Api.LicenseDelegateView {}
+
+      licenseDelegate_onDistributeImpl _self arg = do
+        assertMsg "distribution reported by another distributor" $
+          arg.distributor == owner
+        -- No context means a license that prices nothing itself, charged
+        -- by use; a context without a decimal weight is a license that
+        -- tried to and failed, refused rather than billed by default.
+        weight <- case arg.context of
+          None -> pure default_weight
+          Some (AVMap entries)
+            | Some (AVDecimal w) <- TM.lookup weight_key entries -> pure w
+          Some _ -> abort "the context carries no weight"
+        void $ create DistributionMarker with
+          distributor = owner
+          accountants
+          definition
+          license = arg.license
+          fromRound = arg.roundNumber
+          toRound = arg.roundNumber
+          count = 1
+          weight
+          capsule = arg.capsule
+          closed = None
+          sequence = None
+
+      licenseDelegate_subdelegateImpl _self arg = do
+        assertMsg "subdelegation requested by another licensor" $
+          arg.licensor == owner
+        Some . toInterfaceContractId <$> create this with
+          owner = arg.actor
+          licensees = arg.licensees
+
+-- | The key of the weight in the context of a distribution report.
+weight_key = "weight"
+
+-- | The weight of a distribution reported without a context: paid for by
+-- use, as the reference license of caps-core reports.
+default_weight : Decimal
+default_weight = 1.0

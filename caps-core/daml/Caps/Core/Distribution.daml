@@ -1,0 +1,57 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | The steps every reference license shares: read the source capsule,
+-- create the capsule for the clients and report it to the delegate; give a
+-- sublicense its delegate. With the source given as a view, nothing here
+-- reaches a contract of the operator or of a licensor above; given by id,
+-- the fetch of the source informs its distributor.
+module Caps.Core.Distribution
+  ( distribute
+  , sublicenseDelegate
+  ) where
+
+import DA.Optional (fromOptional, whenSome)
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.Core.Capsule (Capsule(..))
+import DataStandard.Utils (AnyValue)
+
+-- | Create the capsule for `arg.clients` from `arg.source`, distributed by
+-- `owner` under `license`, and report it to `delegate` with `context`. A
+-- license that replaces its contract passes the one it was issued with as
+-- `origin`, which the delegate is told instead. Fails when the source
+-- belongs to another definition.
+distribute
+  : ContractId Api.License -> Optional (ContractId Api.License) -> ContractId Api.DataDefinition
+  -> Party -> Optional (ContractId Api.LicenseDelegate) -> Optional AnyValue
+  -> Api.License_Distribute -> Update (ContractId Api.Capsule)
+distribute license origin definition owner delegate context arg = do
+  source <- case arg.source of
+    Api.ByView v -> pure v
+    Api.ById cid -> view <$> fetch cid
+  assertMsg "capsule belongs to another definition" $
+    source.definition == definition
+  capsule <- toInterfaceContractId <$> create Capsule with
+    definition
+    roundNumber = source.roundNumber
+    content = source.content with
+      license
+      dataPoint = source.content.dataPoint with distributor = owner
+    distributor = owner
+    observers = arg.clients
+  whenSome delegate $ \d -> exercise d Api.LicenseDelegate_OnDistribute with
+    distributor = owner, license = fromOptional license origin, roundNumber = source.roundNumber
+    capsule = Some capsule, clients = None, context
+  pure capsule
+
+-- | The delegate of a sublicense of `owner`'s license created through
+-- `arg`: the one the parent's `delegate` returns, or None.
+sublicenseDelegate
+  : Party -> Optional (ContractId Api.LicenseDelegate) -> Api.License_CreateSublicense
+  -> Update (Optional (ContractId Api.LicenseDelegate))
+sublicenseDelegate owner delegate arg = case delegate of
+  None -> pure None
+  Some parent -> exercise parent Api.LicenseDelegate_Subdelegate with
+    licensor = owner, actor = arg.actor, licenseType = arg.licenseType
+    licensees = arg.licensees

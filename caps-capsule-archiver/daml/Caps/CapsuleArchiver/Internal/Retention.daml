@@ -1,0 +1,25 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | The retention rule behind `CapsuleArchiver`, over capsule views.
+module Caps.CapsuleArchiver.Internal.Retention
+  ( staleCapsules
+  ) where
+
+import DA.Action (filterA)
+import DA.Time (RelTime, addRelTime, isLedgerTimeGT)
+
+import qualified Caps.Api.CoreV1 as Api
+
+-- | The capsules at least `keptRounds` rounds behind round `roundNumber`
+-- whose publication lies more than `keepPeriod` before ledger time, in the
+-- order given.
+staleCapsules : Int -> RelTime -> Int -> [(a, Api.CapsuleView)] -> Update [(a, Api.CapsuleView)]
+staleCapsules keptRounds keepPeriod roundNumber capsules =
+  filterA (isStale keptRounds keepPeriod roundNumber . snd) capsules
+
+isStale : Int -> RelTime -> Int -> Api.CapsuleView -> Update Bool
+isStale keptRounds keepPeriod roundNumber capsule =
+  if capsule.roundNumber + keptRounds <= roundNumber
+    then isLedgerTimeGT $ addRelTime capsule.content.dataPoint.publishedAt keepPeriod
+    else pure False

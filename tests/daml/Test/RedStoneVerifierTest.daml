@@ -1,0 +1,386 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Tests of the RedStone verifier against payloads produced by the RedStone
+-- protocol library (`@redstone-finance/protocol`) and signed by three test
+-- node keys, plus the full data path of the reference implementation with
+-- this verifier as the definition's canonical one.
+--
+-- The vectors must not be regenerated to make a test pass: a failure means
+-- the verifier diverged from the format the nodes sign. To reproduce them:
+-- the node keys are the secp256k1 private keys 1, 2 and 3; each node signs
+-- one `DataPackage` of two `NumericDataPoint`s, BTC and ETH, at timestamp
+-- 1789000000000 ms, with the values listed at each payload below; the
+-- payload is `RedstonePayload.prepare(packages, "")`, and the commitment is
+-- the keccak256 of its bytes. The production vector is a gateway response
+-- for `redstone-primary-prod` prepared the same way.
+module Test.RedStoneVerifierTest where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import qualified DA.TextMap as TM
+import DA.Time (addRelTime, hours, minutes, seconds, milliseconds, time)
+import DA.Date (Month(Jan), date)
+import Daml.Script
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.Core.DataDefinition
+import Caps.Core.License (License(..))
+import Caps.Verifier.RedStone
+import RedStone.PrimaryProdConfig (redstone_primary_prod_public_keys)
+import DataStandard.DataPointV1 (PublishedDataPointView(..))
+import DataStandard.Utils (AnyValue(..), emptyMetadata)
+
+-- Vectors -------------------------------------------------------------------
+
+-- | The public keys of private keys 1, 2 and 3.
+testSigners : [Text]
+testSigners = ["0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8", "04c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee51ae168fea63dc339a3c58419466ceaeef7f632653266d0e1236431a950cfe52a", "04f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9388f7b0f632de8140fe337e62a37f3566500a99934c2231b6cb9fd7584b8e672"]
+
+fixingTime : Time
+fixingTime = addRelTime (time (date 1970 Jan 1) 0 0 0) (milliseconds 1789000000000)
+
+-- | The median of the three nodes' values: BTC 50000.12345678, 50010.5,
+-- 49990.0 and ETH 3000.1, 3001.2, 2999.9, signed by keys 1, 2, 3 in turn.
+medianValues : TM.TextMap AnyValue
+medianValues = TM.fromList [("BTC", AVDecimal 50000.12345678), ("ETH", AVDecimal 3000.1)]
+
+-- | All three packages.
+payloadFull : Text
+payloadFull = "42544300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000048c27f5b14e455448000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000045d9fd4e8001a088b5a20000000020000002246bb043828e9ace345e79dca7f457a6029fa190d99cb2ba7ccced521ab9056a59f03d1074528012e05caf9b98f48cac66dcc8f67561658673ce1d69a6cc398c1b42544300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000048c65cf0a80455448000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000045e08bc60001a088b5a20000000020000002c261f796606b7c61bb1fb1d70cb3abd1ff77d412a7c3c9809f96aaaaf7f100757c236b9b97546afb98a4847fa5a045920dbeb0537691eecb395fc75612571ce81c42544300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000048beb9e8600455448000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000045d8cc218001a088b5a20000000020000002ab3338a7a803989f7835bbaa4f971a816c2fabfc01eee4b940efb1275a57912a607dd6dc567c41327ddd67ddb79e59a6401343947e924a299513e7283a15f5721c0003000000000002ed57011e0000"
+
+-- | The packages of keys 1 and 2 only.
+payloadTwoSigners : Text
+payloadTwoSigners = "42544300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000048c27f5b14e455448000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000045d9fd4e8001a088b5a20000000020000002246bb043828e9ace345e79dca7f457a6029fa190d99cb2ba7ccced521ab9056a59f03d1074528012e05caf9b98f48cac66dcc8f67561658673ce1d69a6cc398c1b42544300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000048c65cf0a80455448000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000045e08bc60001a088b5a20000000020000002c261f796606b7c61bb1fb1d70cb3abd1ff77d412a7c3c9809f96aaaaf7f100757c236b9b97546afb98a4847fa5a045920dbeb0537691eecb395fc75612571ce81c0002000000000002ed57011e0000"
+
+-- | The packages of keys 1 and 2, and key 3's values signed by key 4.
+payloadForeignThird : Text
+payloadForeignThird = "42544300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000048c27f5b14e455448000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000045d9fd4e8001a088b5a20000000020000002246bb043828e9ace345e79dca7f457a6029fa190d99cb2ba7ccced521ab9056a59f03d1074528012e05caf9b98f48cac66dcc8f67561658673ce1d69a6cc398c1b42544300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000048c65cf0a80455448000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000045e08bc60001a088b5a20000000020000002c261f796606b7c61bb1fb1d70cb3abd1ff77d412a7c3c9809f96aaaaf7f100757c236b9b97546afb98a4847fa5a045920dbeb0537691eecb395fc75612571ce81c42544300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000048beb9e8600455448000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000045d8cc218001a088b5a20000000020000002d3dd50afa4ec10be862aed9f49e8a006076d2022906d7a0762db39ba2558f94846d326bf392f94c0d5881f22b64bbb16037aa2eee50e434add47ed89c267959d1c0003000000000002ed57011e0000"
+
+-- | The packages of keys 1 and 2, and a second package by key 1 with BTC
+-- 51000 and ETH 3000.1.
+payloadConflicting : Text
+payloadConflicting = "42544300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000048c27f5b14e455448000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000045d9fd4e8001a088b5a20000000020000002246bb043828e9ace345e79dca7f457a6029fa190d99cb2ba7ccced521ab9056a59f03d1074528012e05caf9b98f48cac66dcc8f67561658673ce1d69a6cc398c1b42544300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000048c65cf0a80455448000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000045e08bc60001a088b5a20000000020000002c261f796606b7c61bb1fb1d70cb3abd1ff77d412a7c3c9809f96aaaaf7f100757c236b9b97546afb98a4847fa5a045920dbeb0537691eecb395fc75612571ce81c4254430000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004a36fb03800455448000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000045d9fd4e8001a088b5a200000000200000021b52eede1129b2763eace73651a7ca2d8c73a5fb8f393346c169c2a7814ad5d774a70650804a8d6ed6f46aa611eb54b55752db3d290d762ebcf360d6f00cf1ce1b0003000000000002ed57011e0000"
+
+-- | `payloadFull` with the last nibble of key 1's BTC value flipped.
+payloadTampered : Text
+payloadTampered = "42544300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000048c27f5b140455448000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000045d9fd4e8001a088b5a20000000020000002246bb043828e9ace345e79dca7f457a6029fa190d99cb2ba7ccced521ab9056a59f03d1074528012e05caf9b98f48cac66dcc8f67561658673ce1d69a6cc398c1b42544300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000048c65cf0a80455448000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000045e08bc60001a088b5a20000000020000002c261f796606b7c61bb1fb1d70cb3abd1ff77d412a7c3c9809f96aaaaf7f100757c236b9b97546afb98a4847fa5a045920dbeb0537691eecb395fc75612571ce81c42544300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000048beb9e8600455448000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000045d8cc218001a088b5a20000000020000002ab3338a7a803989f7835bbaa4f971a816c2fabfc01eee4b940efb1275a57912a607dd6dc567c41327ddd67ddb79e59a6401343947e924a299513e7283a15f5721c0003000000000002ed57011e0000"
+
+expectedDataHash : Text
+expectedDataHash = "6938dd6d48625c3a6f2e0c31c8e39ab25c2caa30b92cbddf9f62f5bfe999a9fd"
+
+-- | A payload served by a public RedStone gateway for `redstone-primary-prod`
+-- on 2026-10-07: BTC and ETH, five production nodes each, one timestamp.
+productionPayload : Text
+productionPayload = "4254430000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007986dc9b8c001a1164ff02000000020000001257f63758ef15cb387c52708ea7ac027fefaadd0e26349ae43c783996454818b5d17ded7039e23e2ee6fd9c7349398f657fe78a7ea1a6136e0046c990008b7be1b4254430000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007986dc9b8c001a1164ff020000000200000010f05c1db3ff96c9f561665b6549fb2334ca05388419b6d7c3c6766502166e5a03ed6748a72cab3544772acb3098fc3a790ff26205ccf946f7fcfae1d6129b49b1b42544300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000079871dcd00001a1164ff02000000020000001f7df4ef0b3edf94844fafad8a1c0a9c1fa78295307b76c8bf766bb4a1a56c3de543491bf3189510dd6e6ef818a7943ea8e4fa096ec105a435a60d6b8f277d9691b42544300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000079871dcd00001a1164ff020000000200000016ae60e615d5e16f2a84a83669a0d0e6df5142d528fb93cdce1b8ff59423b9430096b61bf75042283b76559aad9511574b756dd1edd243616a5e783d74a96adc81b4254430000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007986dc9b8c001a1164ff02000000020000001d807cbd292ed3b868e4ca92f1c4d66a95b4cd4fa168dfdd23da87d1fe73a6ef15382c32350cad6510ad029beb81201945f9426d9ec2b09b652b8dcbfd652b3dc1c45544800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003bffc2908001a1164ff02000000020000001bdff8af04ac9cc60f275755b8975c2107e6aa18f4fe132431bb1caea1da4b32b741ee14dca3aefb32ba35cc0b317f8d28bdca7a8eb429d6816cb9c72374c0a931c45544800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003bffc2908001a1164ff02000000020000001b6e49dae33f217bbf522e6d4087a1cf34b60a0a1c55d4c1356504e4b03bff4c6792d538a52f368e1a3bdac7ead10ebfd44b0232f36ca4529fa1f6f25988409b51b45544800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003bff6abc2001a1164ff02000000020000001f9c978957f64ba586ffc67d443a6a938de305b043b3ab81cb65656ac8e79fa0c4aaa4e7e3f58deccf7fc669770258b6d8100b74639012dba2839c1fb5aae8f191b45544800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003bff6abc2001a1164ff02000000020000001c39c4eefef713c174d682362d87917f188b32e6d1c399b14340a252887d1588428cf1be2e9f1eff714b7ab865d315fdf9e348767e8fb7fe0b4c14be14b4ab1ea1b45544800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003bffc2908001a1164ff020000000200000010562c3b8440f635881893bcde3b5e5a0de1831297ea205b9d54ec9c596087f090a1db3b8a9a00a9b37dc60ffbdedb05c820eda9eae789bdd537644397d8f257a1b000a000000000002ed57011e0000"
+
+productionFixingTime : Time
+productionFixingTime = addRelTime (time (date 1970 Jan 1) 0 0 0) (milliseconds 1791375700000)
+
+-- | The medians of the five nodes' values in that payload.
+productionValues : TM.TextMap AnyValue
+productionValues = TM.fromList [("BTC", AVDecimal 83512.5836), ("ETH", AVDecimal 2576.9401152)]
+
+productionDataHash : Text
+productionDataHash = "fc83b7a5a0032c28f9192f0d683e22afcae57929b7a491c784b26f1cc991d53a"
+
+-- Fixture -------------------------------------------------------------------
+
+data Feed = Feed with
+    operator : Party
+    auditor : Party
+    reader : Party
+    licensee : Party
+    client : Party
+    verifier : ContractId Api.Verifier
+    definition : ContractId Api.DataDefinition
+    head : ContractId Api.RoundHead
+    rootLicense : ContractId Api.License
+
+-- | A feed whose canonical verifier is a `RedStoneVerifier` over the test
+-- node keys with a 3-of-3 threshold. The ledger clock is set a minute before
+-- the vectors' fixing time, so the genesis round precedes it.
+setup : Script Feed
+setup = do
+  setTime (addRelTime fixingTime (negate (minutes 1)))
+  operator <- allocateParty "Operator"
+  auditor <- allocateParty "Auditor"
+  reader <- allocateParty "Reader"
+  licensee <- allocateParty "Licensee"
+  client <- allocateParty "Client"
+
+  verifierCid <- submit operator $ createCmd RedStoneVerifier with
+    owner = operator, observers = [reader, licensee]
+    signers = testSigners, signerCountThreshold = 3, feedIds = ["BTC", "ETH"]
+    maxBehind = hours 1, maxAhead = minutes 5
+  let verifier = toInterfaceContractId @Api.Verifier verifierCid
+
+  proposal <- submit operator $ createCmd DefinitionProposal with
+    dataId = "BTC,ETH", operator, auditors = [auditor], readers = [reader, licensee], verifier
+    publishers = None, accepted = []
+  accepted <- submit auditor $ exerciseCmd proposal DefinitionProposal_Accept with auditor
+  (definitionCid, headCid) <- submit operator $ exerciseCmd accepted DefinitionProposal_Finalize
+  let definition = toInterfaceContractId @Api.DataDefinition definitionCid
+      head = toInterfaceContractId @Api.RoundHead headCid
+
+  rootLicenseCid <- submit operator $ createCmd License with
+    definition, owner = operator, licensor = operator, operator
+    licensees = [licensee], licenseType = AVText "root", validUntil = None
+    delegate = None
+  let rootLicense = toInterfaceContractId @Api.License rootLicenseCid
+  pure Feed with ..
+
+dataPoint : Party -> Time -> TM.TextMap AnyValue -> PublishedDataPointView
+dataPoint distributor publishedAt values = PublishedDataPointView with
+  distributor, publishedAt, schemaVersion = "redstone-1", values, metadata = emptyMetadata
+
+content : Feed -> Text -> Api.CapsuleContent
+content feed payload = Api.CapsuleContent with
+  dataPoint = dataPoint feed.operator fixingTime medianValues
+  payload = AVText payload
+  license = feed.rootLicense
+
+capsule : Feed -> Api.CapsuleContent -> Api.CapsuleView
+capsule feed c = Api.CapsuleView with definition = feed.definition, roundNumber = 1, content = c
+
+-- | A consumer's own verifier instance and the outcome of verifying `c`
+-- through it.
+verifyAsClient
+  : Feed -> Api.CapsuleContent -> Script (ContractId Api.Verifier, Api.VerificationResult)
+verifyAsClient feed c = do
+  own <- submit feed.client $ createCmd RedStoneVerifier with
+    owner = feed.client, observers = []
+    signers = testSigners, signerCountThreshold = 3, feedIds = ["BTC", "ETH"]
+    maxBehind = hours 1, maxAhead = minutes 5
+  let ownVerifier = toInterfaceContractId @Api.Verifier own
+  result <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_Verify with
+    actor = feed.client, capsule = capsule feed c
+  pure (ownVerifier, result)
+
+-- | The verify is reported as rejected, with at least one reason, and the
+-- transaction itself succeeds.
+verifyAsClientRejects : Feed -> Api.CapsuleContent -> Script ()
+verifyAsClientRejects feed c = do
+  (_, result) <- verifyAsClient feed c
+  case result of
+    Api.Rejected (_ :: _) -> pure ()
+    other -> fail $ "expected a rejection, got " <> show other
+
+verifyFreshnessAt : Feed -> ContractId Api.Verifier -> Api.CapsuleContent -> Time -> Script Api.CheckResult
+verifyFreshnessAt feed verifier c asOf =
+  submit feed.client $ exerciseCmd verifier Api.Verifier_VerifyFreshness with
+    actor = feed.client, capsule = capsule feed c, asOf
+
+-- Verifier ------------------------------------------------------------------
+
+testVerifiesFullPayload : Script ()
+testVerifiesFullPayload = do
+  feed <- setup
+  let c = content feed payloadFull
+  (ownVerifier, result) <- verifyAsClient feed c
+  result === Api.Verified expectedDataHash
+  canonical <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+    actor = feed.client, capsule = capsule feed c
+    round = Api.RoundView with
+      definition = feed.definition, roundNumber = 1
+      timestamp = fixingTime, dataHash = expectedDataHash
+  canonical === Api.Passed
+
+testRejectsBelowThreshold : Script ()
+testRejectsBelowThreshold = do
+  feed <- setup
+  verifyAsClientRejects feed $ content feed payloadTwoSigners
+
+testRejectsForeignSigner : Script ()
+testRejectsForeignSigner = do
+  feed <- setup
+  -- Two authentic packages plus one from a key outside the signer set: the
+  -- quorum of three is not reached.
+  verifyAsClientRejects feed $ content feed payloadForeignThird
+
+testRejectsTamperedValue : Script ()
+testRejectsTamperedValue = do
+  feed <- setup
+  -- One nibble of a signed value changed: that package's signature no longer
+  -- matches any signer.
+  verifyAsClientRejects feed $ content feed payloadTampered
+
+testRejectsConflictingSigner : Script ()
+testRejectsConflictingSigner = do
+  feed <- setup
+  -- The same signer submitting two different values for a feed.
+  verifyAsClientRejects feed $ content feed payloadConflicting
+
+testRejectsWrongAggregate : Script ()
+testRejectsWrongAggregate = do
+  feed <- setup
+  let c = (content feed payloadFull) with
+        dataPoint = dataPoint feed.operator fixingTime
+          (TM.insert "BTC" (AVDecimal 50000.5) medianValues)
+  verifyAsClientRejects feed c
+
+-- | A data point carrying only some of the verifier's feeds is rejected even
+-- though every value it carries is authentic: all capsules of a round carry
+-- the same content.
+testRejectsPartialDataPoint : Script ()
+testRejectsPartialDataPoint = do
+  feed <- setup
+  let c = (content feed payloadFull) with
+        dataPoint = dataPoint feed.operator fixingTime (TM.delete "ETH" medianValues)
+  (_, result) <- verifyAsClient feed c
+  result === Api.Rejected ["data point feeds differ from the verifier's"]
+
+testRejectsWrongFixingTime : Script ()
+testRejectsWrongFixingTime = do
+  feed <- setup
+  let c = (content feed payloadFull) with
+        dataPoint = dataPoint feed.operator (addRelTime fixingTime (seconds 1)) medianValues
+  (_, result) <- verifyAsClient feed c
+  result === Api.Rejected ["payload packages rejected: Timestamp too old"]
+
+testRejectsMalformedPayload : Script ()
+testRejectsMalformedPayload = do
+  feed <- setup
+  (_, notHex) <- verifyAsClient feed $ content feed "zz"
+  notHex === Api.Rejected ["malformed RedStone payload: Payload is not a valid hex string"]
+  (_, noMarker) <- verifyAsClient feed $ content feed "ffffffffffffffffffffffffffffff"
+  noMarker === Api.Rejected ["malformed RedStone payload: Wrong RedStone marker"]
+  (_, truncated) <- verifyAsClient feed $ content feed "0001000000000002ed57011e0000"
+  truncated === Api.Rejected ["malformed RedStone payload: List too short"]
+
+testRejectsWrongRound : Script ()
+testRejectsWrongRound = do
+  feed <- setup
+  let c = content feed payloadFull
+  (ownVerifier, _) <- verifyAsClient feed c
+  wrongNumber <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+    actor = feed.client, capsule = capsule feed c
+    round = Api.RoundView with
+      definition = feed.definition, roundNumber = 2
+      timestamp = fixingTime, dataHash = expectedDataHash
+  wrongNumber === Api.Failed ["round number mismatch"]
+  wrongTime <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+    actor = feed.client, capsule = capsule feed c
+    round = Api.RoundView with
+      definition = feed.definition, roundNumber = 1
+      timestamp = addRelTime fixingTime (seconds 1), dataHash = expectedDataHash
+  wrongTime === Api.Failed ["round timestamp differs from the fixing time"]
+  wrongHash <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+    actor = feed.client, capsule = capsule feed c
+    round = Api.RoundView with
+      definition = feed.definition, roundNumber = 1, timestamp = fixingTime, dataHash = "00"
+  wrongHash === Api.Failed ["round commitment mismatch"]
+
+testRejectsRoundOfAnotherDefinition : Script ()
+testRejectsRoundOfAnotherDefinition = do
+  feed <- setup
+  let c = content feed payloadFull
+  (ownVerifier, _) <- verifyAsClient feed c
+  proposal <- submit feed.operator $ createCmd DefinitionProposal with
+    dataId = "SOL", operator = feed.operator, auditors = [], readers = [], verifier = feed.verifier
+    publishers = None, accepted = []
+  (otherDefinition, _) <- submit feed.operator $ exerciseCmd proposal DefinitionProposal_Finalize
+  result <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+    actor = feed.client, capsule = capsule feed c
+    round = Api.RoundView with
+      definition = toInterfaceContractId otherDefinition, roundNumber = 1
+      timestamp = fixingTime, dataHash = expectedDataHash
+  result === Api.Failed ["round belongs to another definition"]
+
+testFreshness : Script ()
+testFreshness = do
+  feed <- setup
+  let c = content feed payloadFull
+  (ownVerifier, _) <- verifyAsClient feed c
+  let freshnessAt asOf = submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyFreshness with
+        actor = feed.client, capsule = capsule feed c, asOf
+  fresh <- freshnessAt $ addRelTime fixingTime (minutes 30)
+  fresh === Api.Passed
+  stale <- freshnessAt $ addRelTime fixingTime (hours 2)
+  stale === Api.Failed ["fixing time too far in the past"]
+  early <- freshnessAt $ addRelTime fixingTime (negate (minutes 10))
+  early === Api.Failed ["fixing time too far in the future"]
+
+testFreshnessAcceptsWindowEdges : Script ()
+testFreshnessAcceptsWindowEdges = do
+  feed <- setup
+  let c = content feed payloadFull
+  (ownVerifier, _) <- verifyAsClient feed c
+  forA_ [addRelTime fixingTime (hours 1), addRelTime fixingTime (negate (minutes 5))] $ \asOf -> do
+    result <- verifyFreshnessAt feed ownVerifier c asOf
+    result === Api.Passed
+
+testFreshnessRejectsBeyondWindowEdges : Script ()
+testFreshnessRejectsBeyondWindowEdges = do
+  feed <- setup
+  let c = content feed payloadFull
+  (ownVerifier, _) <- verifyAsClient feed c
+  forA_
+    [ (addRelTime fixingTime (hours 1 + milliseconds 1), "fixing time too far in the past")
+    , (addRelTime fixingTime (negate (minutes 5 + milliseconds 1)), "fixing time too far in the future")
+    ] $ \(asOf, rejection) -> do
+      result <- verifyFreshnessAt feed ownVerifier c asOf
+      result === Api.Failed [rejection]
+
+-- Data path -----------------------------------------------------------------
+
+testPublishAndDistributeRedStoneRound : Script ()
+testPublishAndDistributeRedStoneRound = do
+  feed <- setup
+  setTime (addRelTime fixingTime (seconds 10))
+  result <- submit feed.licensee $ exerciseCmd feed.head Api.RoundHead_CreateRound with
+    actor = feed.licensee, content = content feed payloadFull
+  Some roundView <- queryInterfaceContractId feed.reader result.round
+  roundView.roundNumber === 1
+  roundView.timestamp === fixingTime
+  roundView.dataHash === expectedDataHash
+
+  -- A forged payload cannot become a round.
+  submitMustFail feed.licensee $ exerciseCmd result.head Api.RoundHead_CreateRound with
+    actor = feed.licensee
+    content = (content feed payloadTampered) with
+      dataPoint = dataPoint feed.operator (addRelTime fixingTime (seconds 1)) medianValues
+
+  -- The licensee distributes the root capsule; the client verifies it on
+  -- its own verifier against the round it reads.
+  Some rootView <- queryInterfaceContractId feed.licensee result.capsule
+  sublicense <- submit feed.licensee $
+    exerciseCmd feed.rootLicense Api.License_CreateSublicense with
+      actor = feed.licensee, licenseType = AVText "redistribution", licensees = []
+  distributed <- submit feed.licensee $ exerciseCmd sublicense Api.License_Distribute with
+    source = Api.ByView rootView, clients = [feed.client]
+  Some distributedView <- queryInterfaceContractId feed.client distributed
+  own <- submit feed.client $ createCmd RedStoneVerifier with
+    owner = feed.client, observers = []
+    signers = testSigners, signerCountThreshold = 3, feedIds = ["BTC", "ETH"]
+    maxBehind = hours 1, maxAhead = minutes 5
+  let ownVerifier = toInterfaceContractId @Api.Verifier own
+  verified <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_Verify with
+    actor = feed.client, capsule = distributedView
+  verified === Api.Verified expectedDataHash
+  canonical <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+    actor = feed.client, capsule = distributedView, round = roundView
+  canonical === Api.Passed
+
+-- Production nodes ----------------------------------------------------------
+
+-- | The verifier configured with the production node keys the RedStone SDK
+-- ships, at its default 3-of-5 threshold, accepts a payload the production
+-- nodes signed and commits to it as the generator computed.
+testVerifiesProductionPayload : Script ()
+testVerifiesProductionPayload = do
+  feed <- setup
+  own <- submit feed.client $ createCmd RedStoneVerifier with
+    owner = feed.client, observers = []
+    signers = redstone_primary_prod_public_keys, signerCountThreshold = 3
+    feedIds = ["BTC", "ETH"], maxBehind = hours 1, maxAhead = minutes 5
+  let ownVerifier = toInterfaceContractId @Api.Verifier own
+      c = Api.CapsuleContent with
+        dataPoint = dataPoint feed.operator productionFixingTime productionValues
+        payload = AVText productionPayload
+        license = feed.rootLicense
+  verified <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_Verify with
+    actor = feed.client, capsule = capsule feed c
+  verified === Api.Verified productionDataHash
+  -- The test node keys do not sign production data.
+  verifyAsClientRejects feed c

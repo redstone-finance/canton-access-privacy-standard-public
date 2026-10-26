@@ -1,0 +1,73 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | A verifier for tests, free of cryptography. A payload is authentic when
+-- it is the text `acceptedTag`; the round commitment is a SHA-256 over the
+-- data point's fixing time and values; a fixing time is fresh within
+-- `maxBehind` and `maxAhead` of the reference time. Enough to exercise every
+-- path of the reference implementation without a signing scheme.
+module Caps.Test.Fixtures.TestVerifier where
+
+import DA.Text (sha256)
+import DA.Time (RelTime, addRelTime)
+
+import qualified Caps.Api.CoreV1 as Api
+import DataStandard.DataPointV1 (PublishedDataPointView)
+import DataStandard.Utils (AnyValue(..))
+
+template TestVerifier
+  with
+    owner : Party
+    acceptedTag : Text
+    observers : [Party]
+      -- ^ For the canonical instance, the readers: a publication exercises
+      -- the verifier, and a contract used in a transaction must be visible
+      -- to the submitter. A consumer's own instance needs none.
+    maxBehind : RelTime
+      -- ^ How far behind the reference time a fixing time may be.
+    maxAhead : RelTime
+      -- ^ How far ahead of the reference time a fixing time may be.
+  where
+    signatory owner
+    observer observers
+
+    interface instance Api.Verifier for TestVerifier where
+      view = Api.VerifierView {}
+
+      verifier_verifyImpl _self arg = pure $ verdict (testCommitment arg.capsule.content.dataPoint)
+        [ ("payload is not authentic", arg.capsule.content.payload == AVText acceptedTag) ]
+
+      verifier_verifyRoundImpl _self arg = pure $ outcome
+        [ ("round belongs to another definition", arg.round.definition == arg.capsule.definition)
+        , ("round number mismatch", arg.round.roundNumber == arg.capsule.roundNumber)
+        , ("round timestamp differs from the fixing time", arg.round.timestamp == arg.capsule.content.dataPoint.publishedAt)
+        , ("commitment mismatch", arg.round.dataHash == testCommitment arg.capsule.content.dataPoint)
+        ]
+
+      verifier_verifyFreshnessImpl _self arg =
+        let fixingTime = arg.capsule.content.dataPoint.publishedAt
+        in pure $ outcome
+          [ ("fixing time too far in the past", fixingTime >= addRelTime arg.asOf (negate maxBehind))
+          , ("fixing time too far in the future", fixingTime <= addRelTime arg.asOf maxAhead)
+          ]
+
+-- | The reasons of the failed checks, in order.
+failures : [(Api.RejectionReason, Bool)] -> [Api.RejectionReason]
+failures checks = [ reason | (reason, ok) <- checks, not ok ]
+
+-- | `Verified` with the commitment when every check holds, otherwise the
+-- reasons of the failed ones.
+verdict : Text -> [(Api.RejectionReason, Bool)] -> Api.VerificationResult
+verdict dataHash checks = case failures checks of
+  [] -> Api.Verified dataHash
+  failed -> Api.Rejected failed
+
+-- | `Passed` when every check holds, otherwise the reasons of the failed ones.
+outcome : [(Api.RejectionReason, Bool)] -> Api.CheckResult
+outcome checks = case failures checks of
+  [] -> Api.Passed
+  failed -> Api.Failed failed
+
+-- | The test verifier's round commitment.
+testCommitment : PublishedDataPointView -> Text
+testCommitment dp = sha256 (show dp.publishedAt <> "|" <> show dp.values)

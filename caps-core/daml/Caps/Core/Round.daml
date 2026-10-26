@@ -1,0 +1,39 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | The reference round: the price-free record of a fixing, visible to the
+-- feed's readers.
+module Caps.Core.Round where
+
+import qualified Caps.Api.CoreV1 as Api
+
+-- | One round. Co-signed by the operator and the auditors, whose authority
+-- is available only inside `RoundHead_CreateRound` (from the head), at
+-- bootstrap (from the proposal) and in `Api.Round_Archive`, so the binding
+-- between a round number and a commitment cannot arise anywhere else: not
+-- even the operator can create a round alone, and it retires one only
+-- through `Api.Round_Archive`.
+template Round
+  with
+    definition : ContractId Api.DataDefinition
+    roundNumber : Int
+    timestamp : Time
+    dataHash : Text
+    operator : Party
+    auditors : [Party]
+      -- ^ Co-signatories, as on the head: the operator cannot mint a round
+      -- alone, and retires one only through `Api.Round_Archive`.
+    readers : [Party]
+      -- ^ The feed's readers party (or parties): the audience entitled to
+      -- see that a round exists and to check capsules against it.
+  where
+    signatory operator, auditors
+    observer readers
+
+    interface instance Api.Round for Round where
+      view = Api.RoundView with definition, roundNumber, timestamp, dataHash
+
+      -- The operator alone retires a round, with the auditors' authority it
+      -- carries.
+      round_archiveImpl _self Api.Round_Archive{actor} =
+        assertMsg "only the operator retires a round" $ actor == operator

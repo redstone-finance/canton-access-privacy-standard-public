@@ -1,0 +1,64 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | The terms a sublicense is created with, and their encoding as the
+-- `licenseType` of `License_CreateSublicense`: a map with a `unit` and,
+-- where the terms have one, an `amount` or a `validUntil`. A `licenseType`
+-- that does not decode is refused, except the open license's, which is
+-- anything without a `unit`.
+module Caps.ExtendedLicensing.LicenseType where
+
+import qualified DA.TextMap as TM
+
+import DataStandard.Utils (AnyValue(..), FromAnyValue(..), ToAnyValue(..))
+
+-- | The terms of a sublicense. The open license has none: it is the parent's
+-- kind, paid for by use.
+data LicenseTerms
+  = Consumable
+    -- ^ One distribution, prepaid.
+  | Subscription Time
+    -- ^ Any number of distributions until this time, prepaid.
+  | Credits Int
+    -- ^ This many distributions, prepaid.
+  deriving (Eq, Show)
+
+-- | The encoding: `{unit: "consumable"}`,
+-- `{unit: "subscription", validUntil: t}` and
+-- `{unit: "credits", amount: n}`, with `n` a positive integer.
+instance ToAnyValue LicenseTerms where
+  toAny Consumable = AVMap $ TM.fromList [("unit", AVText unit_consumable)]
+  toAny (Subscription t) =
+    AVMap $ TM.fromList [("unit", AVText unit_subscription), ("validUntil", AVTime t)]
+  toAny (Credits n) = AVMap $ TM.fromList [("unit", AVText unit_credits), ("amount", AVInt n)]
+
+instance FromAnyValue LicenseTerms where
+  fromAny (AVMap fields) = case TM.lookup "unit" fields of
+    Some (AVText unit)
+      | unit == unit_consumable -> Some Consumable
+      | unit == unit_subscription -> Subscription <$> validUntil
+      | unit == unit_credits -> Credits <$> positiveAmount
+    _ -> None
+    where
+      positiveAmount = case TM.lookup "amount" fields of
+        Some (AVInt n) | n > 0 -> Some n
+        _ -> None
+      validUntil = case TM.lookup "validUntil" fields of
+        Some (AVTime t) -> Some t
+        _ -> None
+  fromAny _ = None
+
+-- | Whether a `licenseType` asks for terms at all: a map with a `unit`.
+-- Such a value that does not decode is an error, not an open license.
+hasUnit : AnyValue -> Bool
+hasUnit (AVMap fields) = TM.member "unit" fields
+hasUnit _ = False
+
+unit_consumable : Text
+unit_consumable = "consumable"
+
+unit_subscription : Text
+unit_subscription = "subscription"
+
+unit_credits : Text
+unit_credits = "credits"

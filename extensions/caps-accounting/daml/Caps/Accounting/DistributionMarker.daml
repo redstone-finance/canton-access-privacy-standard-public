@@ -1,0 +1,168 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | The reference distribution marker, in its three states: one
+-- distribution, merged, settled. Open markers are signed by the distributor
+-- alone and observed by the accountants, so no accountant's participant is
+-- needed for a distribution to go through. The accountants learn that and
+-- when a distribution occurred, under which license and for which round,
+-- but not its audience or the capsule's content, which they are no
+-- stakeholders of. The accounting delegate creates one in the same
+-- transaction as the capsule.
+--
+-- Open markers of one distributor, definition, license and set of
+-- accountants merge into one through `DistributionMarker_Merge`, which
+-- either side may exercise to keep its active contracts few. The merged
+-- marker sums the weights and counts and joins the round ranges; which
+-- capsules it covers is recorded by the merge transaction itself, which
+-- consumes the markers naming them, so every party that saw those markers
+-- can tell.
+--
+-- An accountant settles a period with `DistributionMarker_Close`, which
+-- turns open markers into one closed marker co-signed by the distributor
+-- and the accountant, numbered by the accountant's `SettlementHead` for the
+-- license, unique within that head. Nothing merges into a closed marker
+-- and the distributor can neither archive nor forge one, so what the active
+-- contracts hold under an accountant's signature is safe to settle from.
+-- Open markers are not: the distributor, as sole signatory, can archive
+-- or mint one, and both are as visible to the accountants as a distribution is.
+-- Open markers are evidence in their observers' transaction history
+-- before they are contracts.
+module Caps.Accounting.DistributionMarker where
+
+import DA.Foldable (forA_, maximum, minimum)
+import DA.Optional (isNone, isSome, optionalToList)
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.Accounting.SettlementHead
+
+-- | How and when a marker was closed.
+data Closure = Closure with
+    accountant : Party
+      -- ^ The accountant that closed the marker.
+    period : Text
+      -- ^ The settled period, labelled as the implementation documents.
+    closedAt : Time
+      -- ^ When the marker was closed.
+  deriving (Eq, Show, Serializable)
+
+template DistributionMarker
+  with
+    distributor : Party
+      -- ^ The party whose distributions the marker records.
+    accountants : [Party]
+      -- ^ The parties the marker is reported to.
+    definition : ContractId Api.DataDefinition
+      -- ^ The data definition the distributed capsules belong to.
+    license : ContractId Api.License
+      -- ^ The license the distributions were made under, by the contract id
+      -- it was issued with. A license that replaces its contract during its
+      -- life, as a prepaid one does when it counts down, reports that id.
+    fromRound : Int
+      -- ^ The lowest round number among the distributed capsules.
+    toRound : Int
+      -- ^ The highest round number among the distributed capsules. Equal to
+      -- `fromRound` for a marker of one distribution.
+    count : Int
+      -- ^ How many distributions the marker covers; 1 before merging.
+    weight : Decimal
+      -- ^ What the distributions are worth under the license's terms, as the
+      -- license's price list defines it: for instance 1.0 per distribution
+      -- paid for by use and 0.0 for one covered by a prepaid license, so
+      -- that usage is recorded without being charged.
+    capsule : Optional (ContractId Api.Capsule)
+      -- ^ The capsule of a marker of one distribution; None for a merged
+      -- marker.
+    closed : Optional Closure
+      -- ^ None while open. Once set, the closing accountant is a signatory.
+    sequence : Optional Int
+      -- ^ The settlement's number from the accountant's `SettlementHead`;
+      -- set exactly when `closed` is.
+  where
+    signatory distributor, optionalToList ((.accountant) <$> closed)
+    observer accountants
+    ensure count > 0 && weight >= 0.0 && fromRound <= toRound
+      && isSome closed == isSome sequence
+      && optional True (\c -> c.accountant `elem` accountants) closed
+
+    -- | Consume this open marker and the open `others` and create one open
+    -- marker for all of them. The others must be the same distributor's,
+    -- for the same definition and license, reported to the same
+    -- accountants. The distributor's authority to consume and create comes
+    -- from this contract, so an accountant needs none of its own.
+    choice DistributionMarker_Merge : ContractId DistributionMarker
+      with
+        actor : Party
+          -- ^ The distributor or one of the accountants.
+        others : [ContractId DistributionMarker]
+          -- ^ The markers merged into this one; at least one.
+      controller actor
+      do
+        assertMsg "only the distributor or an accountant may merge" $
+          actor == distributor || actor `elem` accountants
+        assertMsg "nothing to merge" $ not $ null others
+        total <- consume this others
+        create this with
+          fromRound = total.fromRound
+          toRound = total.toRound
+          count = total.count
+          weight = total.weight
+          capsule = None
+
+    -- | Consume this open marker and the open `others` and settle them: one
+    -- closed marker for the period, co-signed by the distributor, whose
+    -- authority comes from this contract, and by the closing accountant,
+    -- numbered by `head`, which must be the accountant's for this
+    -- distributor and license.
+    choice DistributionMarker_Close : ContractId DistributionMarker
+      with
+        accountant : Party
+          -- ^ One of the accountants; co-signs the settlement.
+        head : ContractId SettlementHead
+          -- ^ The accountant's settlement sequence for this license.
+        period : Text
+          -- ^ The accountant's label of the period, for instance "2026-10".
+        others : [ContractId DistributionMarker]
+          -- ^ The other markers of the period; may be empty.
+      controller accountant
+      do
+        assertMsg "only an accountant may close" $ accountant `elem` accountants
+        sequenceHead <- fetch head
+        assertMsg "settlement head of another accountant, distributor or license" $
+          (sequenceHead.accountant, sequenceHead.distributor, sequenceHead.license)
+            == (accountant, distributor, license)
+        (number, _) <- exercise head SettlementHead_Advance
+        total <- consume this others
+        closedAt <- getTime
+        create this with
+          fromRound = total.fromRound
+          toRound = total.toRound
+          count = total.count
+          weight = total.weight
+          capsule = None
+          closed = Some Closure with accountant, period, closedAt
+          sequence = Some number
+
+-- | The sums of an open marker and the open others it absorbs, once the
+-- others are checked and archived.
+data Total = Total with
+    fromRound : Int
+    toRound : Int
+    count : Int
+    weight : Decimal
+
+consume : DistributionMarker -> [ContractId DistributionMarker] -> Update Total
+consume this others = do
+  assertMsg "a closed marker cannot be merged or closed again" $ isNone this.closed
+  merged <- forA others fetch
+  forA_ merged $ \other -> do
+    assertMsg "marker of another distributor, definition, license or accountants" $
+      (other.distributor, other.definition, other.license, other.accountants)
+        == (this.distributor, this.definition, this.license, this.accountants)
+    assertMsg "a closed marker cannot be merged" $ isNone other.closed
+  forA_ others archive
+  pure Total with
+    fromRound = minimum $ this.fromRound :: map (.fromRound) merged
+    toRound = maximum $ this.toRound :: map (.toRound) merged
+    count = this.count + sum (map (.count) merged)
+    weight = this.weight + sum (map (.weight) merged)

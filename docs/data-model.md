@@ -127,6 +127,7 @@ template, known to whoever creates an instance.
 | `roundNumber` | `Int` | 0 for the genesis round, then one more per round. |
 | `timestamp` | `Time` | The fixing time, strictly greater than the previous round's. The genesis round carries the bootstrap time. |
 | `dataHash` | `Text` | The verifier's commitment to the root capsule's content, as `Verified` returned it at publication. Empty on the genesis round. |
+| `attestation` | `Optional Text` | An attestation over the round by the attestation keys of the definition's verifier, in the verifier's encoding; `None` on the genesis round and where the verifier names no attestation keys. |
 
 **`LicenseView`**
 
@@ -154,11 +155,12 @@ template, known to whoever creates an instance.
 | `Verifier_Verify` | `actor` | `Party` | The verifying party; sole controller. |
 | | `capsule` | `CapsuleView` | The capsule being checked, as data. |
 | `Verifier_VerifyRound` | `actor`, `capsule` | | As above. |
-| | `round` | `RoundView` | The round as read from the consumer's own participant. |
+| | `round` | `RoundView` | The round as read from the consumer's own participant or, for a consumer that cannot read it, as handed over next to the capsule. |
 | `Verifier_VerifyFreshness` | `actor`, `capsule` | | As above. |
 | | `asOf` | `Time` | The reference time the fixing time is judged against: ledger time at publication, the time the consumer cares about otherwise. |
 | `RoundHead_CreateRound` | `actor` | `Party` | The publisher; sole controller. |
 | | `content` | `CapsuleContent` | The root capsule's content, with the root license in force for this round. |
+| | `attestation` | `Optional Text` | The signature for the round about to be created; required where the verifier names attestation keys. |
 | `Round_Archive` | `actor` | `Party` | The party retiring the round; sole controller. The authority to archive flows from the round. |
 | `License_Distribute` | `source` | `CapsuleSource` | The capsule being redistributed. |
 | | `clients` | `[Party]` | Observers of the new capsule. They see each other. |
@@ -227,6 +229,16 @@ The repository ships three.
 | `caps-verifier-redstone` | `AVText` of a RedStone payload as the nodes sign it and the gateways serve it, hex-encoded: signed data packages, unsigned metadata, the RedStone marker | exactly the verifier's `feedIds`, each equal to the median of the quorum of packages for that feed | keccak256 of the payload bytes |
 | `caps-verifier-datastandard` | `AVMap` with `expiresAt : AVTime` and `signatures : AVList [AVText]`, each signature hex DER ECDSA over the SHA-256 of the envelope's structural root hash | the signed content: its `publishedAt`, `schemaVersion` and `values` are the envelope's | the envelope's structural root hash, the Data Standard's `canonicalHash` |
 | `caps-tests-fixtures` (`TestVerifier`) | `AVText` equal to the configured tag; no cryptography | anything | SHA-256 over the fixing time and the values |
+
+Where a verifier names attestation keys, the round's `attestation` is a
+signature over `caps-round-attestation-v1|roundNumber|dataHash`, which the
+RedStone and Data Standard verifiers export as `attestationMessage`. The
+RedStone verifier checks it with `secp256k1WithEcdsaOnly` over its keccak256,
+with keys in the format of `signers`, as the nodes sign packages; the Data
+Standard verifier with `secp256k1` over the text itself, with DER keys. Both
+take the signature DER-encoded, not as the nodes' r‖s‖v, and fail it in any
+other encoding. The test verifier instead compares a SHA-256 over a shared
+secret, the round number and the commitment.
 
 Rejection reasons are the verifier's. The RedStone verifier prefixes those
 of the RedStone SDK with the error's kind (`verifier configuration
@@ -321,7 +333,8 @@ extensions' checks are listed in [accounting.md](accounting.md) and
   round belongs to this definition; the fixing time is strictly after the
   latest round's; the data point's distributor is the operator; the license
   belongs to this definition and is owned by the operator; the canonical
-  verifier returns `Verified` and passes freshness at ledger time.
+  verifier returns `Verified`, passes freshness at ledger time and passes
+  `Verifier_VerifyRound` for the round about to be created.
 - `License_Distribute`: the license has not expired; the source belongs to
   this definition.
 - `License_CreateSublicense`: the license has not expired; the actor is a

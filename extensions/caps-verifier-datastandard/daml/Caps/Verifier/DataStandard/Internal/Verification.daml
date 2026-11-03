@@ -9,10 +9,13 @@ module Caps.Verifier.DataStandard.Internal.Verification
   , verifyFreshness
   , commitment
   , envelope
+  , attestationMessage
   ) where
 
+import DA.Crypto.Text (fromHex, isHex, secp256k1, toHex)
 import DA.List (dedup, findIndex)
-import DA.Optional (catOptionals)
+import DA.Optional (catOptionals, isNone)
+import qualified DA.Text as T
 import qualified DA.TextMap as TM
 import DA.Time (RelTime, addRelTime)
 
@@ -46,17 +49,55 @@ verifyContent signers signerCountThreshold content = case payload content of
         <> [ "signer quorum not reached: " <> show (length distinct) <> " of " <> show signerCountThreshold
            | length distinct < signerCountThreshold ]
 
--- | Canonicality: the round is this capsule's, at its fixing time, and
--- commits to its content.
-verifyRound : Api.CapsuleView -> Api.RoundView -> Api.CheckResult
-verifyRound capsule round = case commitment capsule.content of
+-- | Canonicality: the round is this capsule's, at its fixing time, commits
+-- to its content and, where `attestationKeys` names any, carries a
+-- signature by one of them over `attestationMessage`.
+verifyRound : [Text] -> Api.CapsuleView -> Api.RoundView -> Api.CheckResult
+verifyRound attestationKeys capsule round = case commitment capsule.content of
   Left reason -> Api.Failed [reason]
-  Right dataHash -> outcome
+  Right dataHash -> outcome $
     [ ("round belongs to another definition", round.definition == capsule.definition)
     , ("round number mismatch", round.roundNumber == capsule.roundNumber)
     , ("round timestamp differs from the fixing time", round.timestamp == capsule.content.dataPoint.publishedAt)
     , ("round commitment mismatch", round.dataHash == dataHash)
-    ]
+    ] <> attestationChecks attestationKeys round
+
+-- | The attestation checks: the round must carry none when the verifier
+-- names no keys, otherwise a DER signature by one of them, DER keys, over
+-- `attestationMessage`.
+attestationChecks : [Text] -> Api.RoundView -> [(Api.RejectionReason, Bool)]
+attestationChecks [] round =
+  [("round carries an attestation but the verifier names no keys", isNone round.attestation)]
+attestationChecks keys round =
+  [("verifier attestation key is not a public key", derKeys)] <> signatureChecks
+  where
+    derKeys = all isDerEncoded keys
+    message = attestationMessage round
+    signatureChecks = case round.attestation of
+      None -> [("round carries no attestation", False)]
+      Some signature
+        | not (isDerEncoded signature) -> [("round attestation is not a DER signature", False)]
+        | otherwise ->
+            [ ("round attestation matches no key", any (secp256k1 signature message) keys)
+            | derKeys ]
+
+-- | Whether `hex` has the DER envelope `DA.Crypto.Text` requires of a
+-- signature and a key, whose builtins abort on anything else: hex bytes, the
+-- SEQUENCE tag and a one-byte length covering the rest.
+isDerEncoded : Text -> Bool
+isDerEncoded hex =
+  isHex hex && T.length hex >= 4 && T.take 2 hex == "30"
+    && fmap (\n -> 2 * (2 + n)) (fromHex (T.substring 2 2 hex)) == Some (T.length hex)
+
+-- | What the key holder signs to attest a round, hex-encoded:
+-- `caps-round-attestation-v1|roundNumber|dataHash`. The fixing time is not
+-- part of it, the envelope `dataHash` commits to carries it; nor is the
+-- definition, a contract id having no text on the ledger, so a key attests
+-- one definition's rounds only. Exposed so that a test computes the same
+-- bytes.
+attestationMessage : Api.RoundView -> Text
+attestationMessage Api.RoundView{roundNumber, dataHash} =
+  toHex $ "caps-round-attestation-v1|" <> show roundNumber <> "|" <> dataHash
 
 -- | Freshness: the fixing time lies within `maxBehind` before and `maxAhead`
 -- after the reference time, and the signed `expiresAt` has not passed.

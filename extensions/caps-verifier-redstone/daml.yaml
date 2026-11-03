@@ -19,6 +19,3 @@ build-options:
   - --ghc-option=-Wunused-binds
   - --ghc-option=-Wunused-matches
   - --target=2.1
-  # The round commitment is a keccak256 over the signed payload; the hash builtin
-  # lives in the alpha DA.Crypto.Text module. Signature checks are the SDK's.
-  - -Wno-crypto-text-is-alpha

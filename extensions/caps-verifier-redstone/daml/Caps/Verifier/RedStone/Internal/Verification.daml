@@ -10,12 +10,13 @@ module Caps.Verifier.RedStone.Internal.Verification
   , verifyRound
   , verifyFreshness
   , commitment
+  , attestationMessage
   ) where
 
-import DA.Crypto.Text (fromHex, isHex, keccak256, toHex)
+import DA.Crypto.Text (fromHex, isHex, keccak256, secp256k1WithEcdsaOnly, toHex)
 import DA.List (chunksOf, sort)
 import DA.Numeric (cast)
-import DA.Optional (fromSomeNote)
+import DA.Optional (fromSomeNote, isNone, isSome)
 import qualified DA.Text as T
 import qualified DA.TextMap as TM
 import DA.Time (RelTime, addRelTime)
@@ -38,17 +39,55 @@ verifyContent signers signerCountThreshold feedIds content =
     ([], None) -> Api.Rejected [notRedStonePayload]
     (failed, _) -> Api.Rejected failed
 
--- | Canonicality: the round is this capsule's, at its fixing time, and
--- commits to its content.
-verifyRound : Api.CapsuleView -> Api.RoundView -> Api.CheckResult
-verifyRound capsule round = case commitment capsule.content of
+-- | Canonicality: the round is this capsule's, at its fixing time, commits
+-- to its content and, where `attestationKeys` names any, carries a
+-- signature by one of them over `attestationMessage`.
+verifyRound : [Text] -> Api.CapsuleView -> Api.RoundView -> Api.CheckResult
+verifyRound attestationKeys capsule round = case commitment capsule.content of
   None -> Api.Failed [notRedStonePayload]
-  Some dataHash -> outcome
+  Some dataHash -> outcome $
     [ ("round belongs to another definition", round.definition == capsule.definition)
     , ("round number mismatch", round.roundNumber == capsule.roundNumber)
     , ("round timestamp differs from the fixing time", round.timestamp == capsule.content.dataPoint.publishedAt)
     , ("round commitment mismatch", round.dataHash == dataHash)
-    ]
+    ] <> attestationChecks attestationKeys round
+
+-- | The attestation checks: the round must carry none when the verifier
+-- names no keys, otherwise a DER signature by one of them over
+-- `attestationMessage`.
+attestationChecks : [Text] -> Api.RoundView -> [(Api.RejectionReason, Bool)]
+attestationChecks [] round =
+  [("round carries an attestation but the verifier names no keys", isNone round.attestation)]
+attestationChecks keys round =
+  [("verifier attestation key is not a public key", isSome derKeys)] <> signatureChecks
+  where
+    derKeys = mapA derPublicKey keys
+    message = attestationMessage round
+    signatureChecks = case round.attestation of
+      None -> [("round carries no attestation", False)]
+      Some signature
+        | not (isDerEncoded signature) -> [("round attestation is not a DER signature", False)]
+        | otherwise ->
+            [ ("round attestation matches no key", any (secp256k1WithEcdsaOnly signature message) ks)
+            | Some ks <- [derKeys] ]
+
+-- | Whether `hex` has the DER envelope `DA.Crypto.Text` requires of a
+-- signature and a key, whose builtins abort on anything else: hex bytes, the
+-- SEQUENCE tag and a one-byte length covering the rest.
+isDerEncoded : Text -> Bool
+isDerEncoded hex =
+  isHex hex && T.length hex >= 4 && T.take 2 hex == "30"
+    && fmap (\n -> 2 * (2 + n)) (fromHex (T.substring 2 2 hex)) == Some (T.length hex)
+
+-- | What the key holder signs to attest a round, as the nodes sign packages:
+-- the keccak256 of `caps-round-attestation-v1|roundNumber|dataHash`. The
+-- fixing time is not part of it, the payload `dataHash` commits to carries
+-- it; nor is the definition, a contract id having no text on the ledger, so
+-- a key attests one definition's rounds only. Exposed so that a test
+-- computes the same bytes.
+attestationMessage : Api.RoundView -> Text
+attestationMessage Api.RoundView{roundNumber, dataHash} =
+  keccak256 $ toHex $ "caps-round-attestation-v1|" <> show roundNumber <> "|" <> dataHash
 
 -- | Freshness: the fixing time lies within `maxBehind` before and `maxAhead`
 -- after the reference time.
@@ -139,3 +178,18 @@ feedIdBytes : Text -> [Int]
 feedIdBytes feedId = map (byte . T.implode) $ chunksOf 2 $ T.explode $ toHex feedId
   where
     byte pair = fromSomeNote ("bad hex byte " <> pair) $ fromHex pair
+
+-- | A key in the format of `signers` as `DA.Crypto.Text` takes it, DER
+-- (SPKI): one with the SPKI header and the length of one is DER already, one
+-- of 65 bytes with the 04 prefix or the 64-byte X||Y gets the header; None
+-- for anything else.
+derPublicKey : Text -> Optional Text
+derPublicKey key
+  | not (isHex hex) = None
+  | spkiHeader `T.isPrefixOf` hex && T.length hex == T.length spkiHeader + 130 = Some hex
+  | "04" `T.isPrefixOf` hex && T.length hex == 130 = Some $ spkiHeader <> hex
+  | T.length hex == 128 = Some $ spkiHeader <> "04" <> hex
+  | otherwise = None
+  where
+    hex = T.asciiToLower key
+    spkiHeader = "3056301006072a8648ce3d020106052b8104000a034200"

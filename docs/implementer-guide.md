@@ -31,6 +31,8 @@ template MyVerifier
       -- the readers, on the canonical instance; empty on a consumer's
     signers : [Text]
     signerCountThreshold : Int
+    attestationKeys : [Text]
+      -- the data producer's; empty when rounds carry no attestation
     maxBehind : RelTime
     maxAhead : RelTime
   where
@@ -40,7 +42,7 @@ template MyVerifier
     interface instance Api.Verifier for MyVerifier where
       view = Api.VerifierView {}
       verifier_verifyImpl _self arg = pure $ verifyContent signers signerCountThreshold arg.capsule.content
-      verifier_verifyRoundImpl _self arg = pure $ verifyRound arg.capsule arg.round
+      verifier_verifyRoundImpl _self arg = pure $ verifyRound attestationKeys arg.capsule arg.round
       verifier_verifyFreshnessImpl _self arg = pure $ verifyFreshness maxBehind maxAhead arg.capsule arg.asOf
 ```
 
@@ -76,10 +78,18 @@ RedStone verifier hashes the payload bytes; the Data Standard verifier
 hashes the signed envelope, which carries no distributor. Choose what a
 third party can recompute from a capsule alone.
 
-**`verifyRound`** compares the round view with the capsule: same
-definition, same round number, round timestamp equal to the fixing time,
-round `dataHash` equal to your commitment of the content. Nothing else: do
-not look at ledger time, do not fetch.
+**`verifyRound`** compares the round view with the capsule: same definition,
+same round number, round timestamp equal to the fixing time, round `dataHash`
+equal to your commitment of the content and, where `attestationKeys` is not
+empty, `attestation` as many signatures by the keys over your attestation
+message as your verifier requires, `None` where it is empty. Make the message a
+function of at least the round number and `dataHash`, and export it, so that
+the key holder computes the same bytes: the shipped verifiers sign
+`caps-round-attestation-v1|roundNumber|dataHash`, the RedStone one its
+keccak256 with `secp256k1WithEcdsaOnly` as the nodes sign packages, the Data
+Standard one the text itself with `secp256k1` over DER keys. A key attests the
+rounds of one definition only; say so in the verifier's documentation. Nothing
+else: do not look at ledger time, do not fetch.
 
 **`verifyFreshness`** judges `dataPoint.publishedAt` against `asOf` and
 your window, inclusive at both edges. Add what your scheme knows, such as
@@ -95,9 +105,6 @@ Rules that are easy to break:
 - The canonical instance needs the readers as observers: a publication
   exercises it, and a contract used in a transaction must be visible to
   the submitter. A consumer's instance has no observers.
-- Hashing builtins live in `DA.Crypto.Text`, which Daml marks alpha; add
-  `-Wno-crypto-text-is-alpha` to `build-options` as the RedStone verifier
-  does.
 
 **Package wiring.** A verifier package depends on the interface DAR and
 the two Data Standard DARs as `data-dependencies`, targets LF 2.1 and sets
@@ -136,7 +143,26 @@ exerciseCmd head Api.RoundHead_CreateRound with
     dataPoint = aggregate          -- publishedAt = the fixing time
     payload = encodedSignedData    -- as your verifier decodes it
     license = rootLicense
+  attestation = Some signature     -- None where the verifier names no keys
 ```
+
+Where the verifier names attestation keys, the signature is the data
+producer's, over the verifier's attestation message for the next round number
+and the commitment of `content`, both known before submission: the number from
+the head's view, the commitment as your verifier computes it (the keccak256 of
+the payload for RedStone, the envelope hash for the Data Standard). The
+specification (section 6) requires the key holder to sign one candidate per
+round number: a retry after a lost race, a pause or a timeout resubmits the
+same candidate, which the head accepts as long as its fixing time is within
+`maxBehind` of ledger time; a new candidate for the same number is signed only
+for a fixing time more than `maxBehind + maxAhead` after the first's, so that
+no reference time admits both. No check enforces this; what polices it is the
+proof two fresh attestations of one number would be. The ledger tells the
+signer which numbers are taken; what the signer must keep, in storage that
+survives a restart, is the candidate it signed and the ledger does not hold: a
+signer that forgets it signs the number twice within the freshness window,
+which a consumer cannot tell from equivocation. Other publishers carry the
+signed candidate; they cannot replace it.
 
 The result carries the successor head; the next publication uses it. A
 failed submission on a consumed head means another publisher won; re-read
@@ -160,7 +186,7 @@ what each change touches:
 |---|---|---|
 | A different signatory policy on the head and rounds | your `RoundHead` and `Round` templates | `RoundHead_CreateRound` meets every MUST of specification §3.3; see [governance.md](governance.md) for the trade-offs |
 | A pause by threshold | a proposal contract around `RoundHead_Pause`, or your own head | pausing stays outside the interface |
-| License kinds with terms or expiry | your `License` templates; `caps-extended-licensing` is one set | `License_Distribute` copies the content unchanged except license and distributor, sets observers to `clients` only, and `License_CreateSublicense` requires a licensee |
+| License kinds with terms or expiry | your `License` templates; `caps-extended-licensing` is one set | `License_Distribute` copies the content unchanged except license and distributor and makes `clients` the observers (adding any other party widens what a distribution reveals), and `License_CreateSublicense` requires a licensee |
 | Accounting, metering or another effect of a distribution | your `LicenseDelegate` template; `caps-accounting` is one | the license calls it in every distribution and sublicense, and the licensees of every license that names it observe it |
 | A capsule with extra fields (e.g. metadata of your own) | your `Capsule` template | the signatory is `content.dataPoint.distributor`, the observers are the audience, `content.dataPoint` equals the `PublishedDataPoint` view |
 | A different bootstrap | your proposal workflow | the genesis round is number 0 with an empty commitment |
@@ -179,10 +205,6 @@ a root license without touching the head.
   `caps-api-core-v2`, which existing consumers do not understand.
 - Verification by contract id. Every verifier choice takes views; adding
   a choice that fetches would inform signatories of consumption.
-- The observers of a distributed capsule: `clients`, and nobody else. A
-  delegate the license names may add informees of the distribution, but
-  only its own signatories, as the table in specification.md section 3.7
-  lays out; it never adds observers to the capsule.
 - The meaning of `roundNumber` and `timestamp`: one more per round,
   strictly increasing fixing times, genesis at 0.
 - The consumer's own verifier instance as the verification path. A design

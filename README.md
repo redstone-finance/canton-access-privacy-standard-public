@@ -25,8 +25,8 @@ its `AnyValue` type.
 | `caps-core` | `caps-core` | The reference implementation of the five data-path interfaces, generic over the oracle: templates for `DataDefinition` (with its bootstrap proposal), `RoundHead`, `Round`, `License` and `Capsule`. The reference license calls its `LicenseDelegate`, when it names one. The only vendor-specific contract a deployment adds is a `Verifier`. |
 | `caps-capsule-archiver` | `caps-capsule-archiver` | Retention for capsules, through the `RoundHead` and `Capsule` interfaces alone: a `CapsuleArchiver` of one distributor for one data definition archives, for any actor that sees it and names the definition's round head, the distributor's capsules at least `keptRounds` rounds behind the head's latest round once `keepPeriod` has passed since their publication, the retention a RedStone price pill follows. |
 | `caps-round-archiver` | `caps-round-archiver` | Retention for rounds, through the `RoundHead` and `Round` interfaces alone: a `RoundArchiver` of the operator for one data definition retires, through `Round_Archive`, the rounds at least `keptRounds` behind the head's latest round once `keepPeriod` has passed since their fixing time, the capsule archiver's rule; the genesis round always stays. |
-| `tests-fixtures` | `caps-tests-fixtures` | `TestVerifier`, a cryptography-free verifier for exercising the reference implementation. Templates only, so the package carries no `daml-script` dependency. |
-| `tests` | `caps-tests` | Daml Script tests: bootstrap, publication and its rejections, the race on the head, pause, distribution by view and by id, sublicensing, revocation, the visibility claims, the RedStone verifier against payloads signed by test node keys, the Data Standard verifier against payloads signed by keys generated in the script, the capsule and round archivers on published rounds, and the extended licenses with the accounting delegate, its markers, merging and settlement. |
+| `tests-fixtures` | `caps-tests-fixtures` | `TestVerifier`, a cryptography-free verifier for exercising the reference implementation, and `Settlement`, a two-party contract that runs the checks on a supplied capsule and round view. Templates only, so the package carries no `daml-script` dependency. |
+| `tests` | `caps-tests` | Daml Script tests: bootstrap, publication and its rejections, the round attestation and the key holder's one candidate per round, a settlement on a supplied round view, the race on the head, pause, distribution by view and by id, sublicensing, revocation, the visibility claims, the RedStone verifier against payloads signed by test node keys, the Data Standard verifier against payloads signed by keys generated in the script, the capsule and round archivers on published rounds, and the extended licenses with the accounting delegate, its markers, merging and settlement. |
 | `deps/` | | Vendored DARs: the Canton Data Standard (`utils-v1` for `AnyValue` and `datapoint-v1` for `PublishedDataPoint`, which the interfaces depend on; `codecs` and `distributor-key-v1`, which the Data Standard verifier delegates to) and the RedStone Daml SDK (`redstone-sdk-v20`, `redstone-common-v20`) the RedStone verifier delegates to. |
 
 ## The model
@@ -34,9 +34,9 @@ its `AnyValue` type.
 | Interface | Signatory | Role |
 |---|---|---|
 | `DataDefinition` | the publishing party, with the auditors in the reference | The data set's identity and anchor: `dataId` and the canonical `verifier`. Read-only; every round, capsule and license points at its contract id. |
-| `Verifier` | whoever creates it | The oracle's signing and aggregation scheme as a contract. A consumer creates its own instance from the same template, so verifying has no informee but the consumer. `Verifier_Verify` proves authenticity, `Verifier_VerifyRound` canonicality, `Verifier_VerifyFreshness` the oracle's acceptance window around a reference time. |
+| `Verifier` | whoever creates it | The oracle's signing and aggregation scheme as a contract. A consumer creates its own instance from the same template, so verifying has no informee but the consumer. `Verifier_Verify` proves authenticity, `Verifier_VerifyRound` canonicality, attestation included for a party that cannot read the round, `Verifier_VerifyFreshness` the oracle's acceptance window around a reference time. |
 | `RoundHead` | the publishing party, with the auditors in the reference | The head of the round chain and the publishing endpoint. One live contract per definition, consumed on every `RoundHead_CreateRound`, so round numbering is unique: two concurrent publications are a double spend of the head. Open to any publisher the implementation admits; the authority to sign the round comes from the contract, not from the caller. |
-| `Round` | the publishing party, with the auditors in the reference | Immutable, price-free record of a fixing: round number, fixing time, a commitment to the data whose scheme the Verifier defines. Visible to the feed's readers. |
+| `Round` | the publishing party, with the auditors in the reference | Immutable, price-free record of a fixing: round number, fixing time, a commitment to the data whose scheme the Verifier defines and, where the Verifier names attestation keys, the data producer's signature over number and commitment. Visible to the feed's readers. |
 | `License` | its owner | A right to distribute and to sublicense. The root is owned by the publishing party; every sublicense by its licensee alone. `License_Distribute` creates a capsule for a list of clients from a source given by view (private) or by contract id (informs the source's signatory). A license may name a `LicenseDelegate`. |
 | `LicenseDelegate` | the implementation's | What a license does on a distribution and a sublicense beyond creating the capsule or the child license. `LicenseDelegate_OnDistribute` is told of every distribution in the same transaction; `LicenseDelegate_Subdelegate`, with the authority of both owners, gives a sublicense its delegate. Its signatories learn of, and confirm, every distribution that calls it. |
 | `Capsule` | its distributor | The unit of distribution. Requires `PublishedDataPoint`. Carries definition, round number, and `CapsuleContent`: data point, opaque signed payload, license. |
@@ -54,8 +54,10 @@ section 5 and walked through in
 
 1. **Authenticity**: `Verifier_Verify` on its own verifier instance, created
    from the template the definition's `verifier` points to.
-2. **Canonicality**: `Verifier_VerifyRound` with the `Round` view read from
-   its own participant.
+2. **Canonicality**: `Verifier_VerifyRound` with the `Round` view read from its
+   own participant or, for a consumer that cannot read the round, the view the
+   presenter hands over next to the capsule, which the round's attestation
+   makes checkable.
 3. **Freshness**: `Verifier_VerifyFreshness` with the time it cares about,
    or its own bound on `content.dataPoint.publishedAt`.
 4. **License**: the license's `owner` is the capsule's distributor and its

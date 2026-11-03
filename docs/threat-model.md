@@ -9,10 +9,13 @@ rounds (operator and auditors) and its variants are in
 ## Proven, policed, out of reach
 
 CAPS gives a consumer two proofs it computes itself, on its own participant,
-with no informee but itself: **authenticity** (`Verifier_Verify`, the
-content is what the oracle's nodes signed) and **canonicality**
-(`Verifier_VerifyRound`, the round it read is the one the content belongs
-to). Everything else is one of two weaker things:
+with no informee but itself: **authenticity** (`Verifier_Verify`, the content
+is what the oracle's nodes signed) and **canonicality**
+(`Verifier_VerifyRound`, the round it read is the one the content belongs to).
+Where the feed attests its rounds, a party that cannot read the round gets the
+second from the view alone, through the round's attestation (the key holder
+designated the content for the round number), proven against everyone but the
+key holder. Everything else is one of two weaker things:
 
 - **Policed**: made visible to a party that can react. License provenance is
   policed: the operator observes every license that names it, the licensor
@@ -109,6 +112,31 @@ consumer assumes.
   capsule or the round, which is what keeps verification free of
   informees; the chain check (specification section 5, check 5) is the
   consumer application's for that reason.
+- **An attestation is proof against everyone but the key holder.** A party
+  without the round learns from `Verifier_VerifyRound` on the view handed over
+  next to the capsule that a key the verifier names signed the content for the
+  round number; no submitter can forge that. What it does not learn is that the
+  ledger holds that round: the key holder can sign two candidates for one
+  number. Honest operation never needs to while both are fresh, since a retry
+  resubmits the same candidate and a new one is signed only past the freshness
+  window, so two fresh attestations of one number are equivocation, and the
+  pair is a portable proof of it. Whoever settled on the losing candidate holds
+  that proof, the producer's signature over content the ledger never fixed next
+  to the round it did, and can show it to anyone; a reader tells cheating from
+  an outage by the fixing times, since two candidates fresh together are
+  equivocation and two that never were are a gap in publication. Policed, not
+  excluded.
+- **A candidate can be attested and never published.** When publication fails
+  for longer than the freshness window, the key holder signs a new candidate
+  for the same number and that one becomes the round. A party without the round
+  that settled on the first during the outage settled on content the producer
+  designated and nobody published; a reader could not have, since no round
+  existed. The two readings part only across such an outage.
+- **The attestation key is one more parameter to pin**, with the node keys. Its
+  compromise lets the holder present any authentic payload as the round, within
+  the freshness window and with the node signatures the payload still needs;
+  rotating it is a new definition, as for node keys. A key attests one
+  definition's rounds only, since the definition is not signed.
 
 ## Accounting
 

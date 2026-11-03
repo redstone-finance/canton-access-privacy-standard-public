@@ -26,12 +26,15 @@ template Round
     readers : [Party]
       -- ^ The feed's readers party (or parties): the audience entitled to
       -- see that a round exists and to check capsules against it.
+    attestation : Optional Text
+      -- ^ The data producer's attestation over the round; None on the genesis
+      -- round and where the verifier names no attestation keys.
   where
     signatory operator, auditors
     observer readers
 
     interface instance Api.Round for Round where
-      view = Api.RoundView with definition, roundNumber, timestamp, dataHash
+      view = Api.RoundView with definition, roundNumber, timestamp, dataHash, attestation
 
       -- The operator alone retires a round, with the auditors' authority it
       -- carries.

@@ -16,8 +16,10 @@
 --
 -- The round commitment is the envelope's structural root hash: the Data
 -- Standard's own `canonicalHash`, so any Data Standard consumer recomputes
--- it from the data point and `expiresAt` alone. A fixing is fresh within
--- `maxBehind` and `maxAhead` of the reference time and not past `expiresAt`.
+-- it from the data point and `expiresAt` alone. A round attestation, where
+-- `attestationKeys` names any, is a DER signature by one of them over
+-- `attestationMessage`. A fixing is fresh within `maxBehind` and `maxAhead`
+-- of the reference time and not past `expiresAt`.
 module Caps.Verifier.DataStandard where
 
 import DA.Time (RelTime)
@@ -27,7 +29,8 @@ import Caps.Verifier.DataStandard.Internal.Verification
 
 -- | The verifier. The canonical instance belongs to the operator and must be
 -- visible to publishers through `observers`; a consumer creates its own
--- instance with the same `signers`, `signerCountThreshold` and window.
+-- instance with the same `signers`, `signerCountThreshold`,
+-- `attestationKeys` and window.
 template DataStandardVerifier
   with
     owner : Party
@@ -37,6 +40,10 @@ template DataStandardVerifier
       -- `DistributorKeyView.publicKey` carries them.
     signerCountThreshold : Int
       -- ^ Minimum number of distinct signers.
+    attestationKeys : [Text]
+      -- ^ Keys a round attestation may be signed with, in the format of
+      -- `signers`; empty for none. A key attests the rounds of one
+      -- definition only.
     maxBehind : RelTime
       -- ^ How far behind the reference time a fixing time may be.
     maxAhead : RelTime
@@ -53,7 +60,7 @@ template DataStandardVerifier
         pure $ verifyContent signers signerCountThreshold arg.capsule.content
 
       verifier_verifyRoundImpl _self arg =
-        pure $ verifyRound arg.capsule arg.round
+        pure $ verifyRound attestationKeys arg.capsule arg.round
 
       verifier_verifyFreshnessImpl _self arg =
         pure $ verifyFreshness maxBehind maxAhead arg.capsule arg.asOf

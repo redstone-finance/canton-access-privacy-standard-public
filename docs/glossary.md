@@ -8,6 +8,17 @@ accounting delegate, separate from the operator, that observes the
 delegates and distribution markers, closes periods and bills. Optional; see
 [accounting.md](accounting.md).
 
+**Attestation.** The data producer's signatures over a round by the
+attestation keys of the definition's verifier, in the verifier's encoding,
+carried in the round where the verifier names such keys, so that a party
+that cannot read the round can check its view. It is the key holder's word
+that it designated that content for that round number, not proof that the
+ledger holds the round.
+
+**Attestation key.** A key the verifier names for attestations: the data
+producer's, not a publisher's. A key attests the rounds of one definition
+only.
+
 **Auditor.** In the reference implementation, a party that co-signs the
 data definition, the round head and every round, so that the operator
 cannot archive the definition or the head, fork the chain or mint a round
@@ -18,10 +29,18 @@ pause publication. Not named by the interfaces.
 oracle's nodes signed and aggregates to what the data point claims.
 Checked by `Verifier_Verify`.
 
+**Candidate.** The content of the next round with the key holder's
+attestation, signed before publication. The key holder signs one per round
+number, retries a failed publication with the same one, and signs another
+for the same number only when no reference time exists at which both would
+pass the freshness check.
+
 **Canonicality.** The property that a capsule's content is what was fixed
 in the round of its number: the round's commitment matches the content.
 Checked by `Verifier_VerifyRound` against the round read from the
-consumer's own participant.
+consumer's own participant or, for a consumer that cannot read it, against
+the view the presenter hands over next to the capsule, which the round's
+attestation makes checkable where the verifier names attestation keys.
 
 **Capsule.** The unit of distribution: a contract implementing `Capsule`
 and the Data Standard's `PublishedDataPoint`, signed by its distributor,
@@ -99,6 +118,11 @@ an empty commitment and no capsule.
 a created or archived contract, signatories and actors of a fetched or
 exercised one, observers of a contract a consuming exercise archives. The
 basis of every privacy rule in the standard.
+
+**Key holder.** The holder of an attestation key: the data producer. A
+publisher that holds none carries the key holder's signed candidate to the
+ledger. Two attestations of one number fresh together are the key holder's
+equivocation, provable by anyone holding both.
 
 **License.** A right to distribute capsules and to sublicense, owned by
 one party. The root license is the operator's; every sublicense is its

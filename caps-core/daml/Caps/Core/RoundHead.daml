@@ -10,11 +10,12 @@
 -- be visible to the submitter's participant, so publishing is open to
 -- whoever sees all three: the operator and the root license's licensees by
 -- observation (provided the verifier's template makes the readers
--- observers), anyone else by explicit disclosure. The root license is read
--- through its interface only, so any License implementation can serve as
--- the root license. The head carries the latest round's number and fixing
--- time itself, so no round is fetched: retiring any round, the latest
--- included, never stops publication.
+-- observers), anyone else by explicit disclosure. Where the verifier names
+-- attestation keys, a publisher also needs an attestation by one of them.
+-- The root license is read through its interface only, so any License
+-- implementation can serve as the root license. The head carries the
+-- latest round's number and fixing time itself, so no round is fetched:
+-- retiring any round, the latest included, never stops publication.
 module Caps.Core.RoundHead where
 
 import DA.Optional (whenSome)
@@ -78,10 +79,10 @@ template RoundHead
               definition
               roundNumber = newNumber
               content = arg.content
-        verification <- exercise verifier Api.Verifier_Verify with
+        authenticity <- exercise verifier Api.Verifier_Verify with
           actor = arg.actor
           capsule = capsuleView
-        dataHash <- case verification of
+        dataHash <- case authenticity of
           Api.Verified dataHash -> pure dataHash
           Api.Rejected reasons ->
             abort $ "the verifier rejected the content: " <> show reasons
@@ -97,6 +98,22 @@ template RoundHead
           Api.Passed -> pure ()
           Api.Failed reasons ->
             abort $ "the verifier rejected the fixing time: " <> show reasons
+        -- The round about to be created, checked as a consumer would check
+        -- it, attestation included: a round on the ledger always passes
+        -- `Verifier_VerifyRound`.
+        canonicality <- exercise verifier Api.Verifier_VerifyRound with
+          actor = arg.actor
+          capsule = capsuleView
+          round = Api.RoundView with
+            definition
+            roundNumber = newNumber
+            timestamp = fixingTime
+            dataHash
+            attestation = arg.attestation
+        case canonicality of
+          Api.Passed -> pure ()
+          Api.Failed reasons ->
+            abort $ "the verifier rejected the round: " <> show reasons
 
         newRound <- create Round with
           definition
@@ -106,6 +123,7 @@ template RoundHead
           operator
           auditors
           readers
+          attestation = arg.attestation
         newHead <- create this with
           round = toInterfaceContractId newRound
           roundNumber = newNumber

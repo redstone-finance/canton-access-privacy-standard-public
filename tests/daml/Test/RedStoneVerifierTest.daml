@@ -18,6 +18,7 @@ module Test.RedStoneVerifierTest where
 
 import DA.Assert ((===))
 import DA.Foldable (forA_)
+import qualified DA.Text as T
 import qualified DA.TextMap as TM
 import DA.Time (addRelTime, hours, minutes, seconds, milliseconds, time)
 import DA.Date (Month(Jan), date)
@@ -27,6 +28,7 @@ import qualified Caps.Api.CoreV1 as Api
 import Caps.Core.DataDefinition
 import Caps.Core.License (License(..))
 import Caps.Verifier.RedStone
+import Caps.Verifier.RedStone.Internal.Verification (attestationMessage)
 import RedStone.PrimaryProdConfig (redstone_primary_prod_public_keys)
 import DataStandard.DataPointV1 (PublishedDataPointView(..))
 import DataStandard.Utils (AnyValue(..), emptyMetadata)
@@ -92,6 +94,8 @@ data Feed = Feed with
     reader : Party
     licensee : Party
     client : Party
+    attester : Secp256k1KeyPair
+      -- ^ The data producer's attestation key, generated for the test.
     verifier : ContractId Api.Verifier
     definition : ContractId Api.DataDefinition
     head : ContractId Api.RoundHead
@@ -108,10 +112,12 @@ setup = do
   reader <- allocateParty "Reader"
   licensee <- allocateParty "Licensee"
   client <- allocateParty "Client"
+  attester <- secp256k1generatekeypair
 
   verifierCid <- submit operator $ createCmd RedStoneVerifier with
     owner = operator, observers = [reader, licensee]
     signers = testSigners, signerCountThreshold = 3, feedIds = ["BTC", "ETH"]
+    attestationKeys = [signersFormat attester]
     maxBehind = hours 1, maxAhead = minutes 5
   let verifier = toInterfaceContractId @Api.Verifier verifierCid
 
@@ -143,6 +149,23 @@ content feed payload = Api.CapsuleContent with
 capsule : Feed -> Api.CapsuleContent -> Api.CapsuleView
 capsule feed c = Api.CapsuleView with definition = feed.definition, roundNumber = 1, content = c
 
+-- | The round a capsule of `payloadFull` belongs to, unattested.
+capsuleRound : Feed -> Api.RoundView
+capsuleRound feed = Api.RoundView with
+  definition = feed.definition, roundNumber = 1, timestamp = fixingTime
+  dataHash = expectedDataHash, attestation = None
+
+-- | `round` with the attestation the data producer signs for it.
+attest : Feed -> Api.RoundView -> Script Api.RoundView
+attest feed round = do
+  signature <- secp256k1signWithEcdsaOnly feed.attester.privateKey (attestationMessage round)
+  pure round with attestation = Some signature
+
+-- | `pair`'s public key in the format of `testSigners`: its DER (SPKI) form
+-- without the 23-byte header.
+signersFormat : Secp256k1KeyPair -> Text
+signersFormat pair = T.drop 46 pair.publicKey
+
 -- | A consumer's own verifier instance and the outcome of verifying `c`
 -- through it.
 verifyAsClient
@@ -151,11 +174,24 @@ verifyAsClient feed c = do
   own <- submit feed.client $ createCmd RedStoneVerifier with
     owner = feed.client, observers = []
     signers = testSigners, signerCountThreshold = 3, feedIds = ["BTC", "ETH"]
+    attestationKeys = [signersFormat feed.attester]
     maxBehind = hours 1, maxAhead = minutes 5
   let ownVerifier = toInterfaceContractId @Api.Verifier own
   result <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_Verify with
     actor = feed.client, capsule = capsule feed c
   pure (ownVerifier, result)
+
+-- | The outcome of checking `round` against a capsule of `payloadFull` on a
+-- consumer's own verifier instance that names `attestationKeys`.
+verifyRoundWith : Feed -> [Text] -> Api.RoundView -> Script Api.CheckResult
+verifyRoundWith feed attestationKeys round = do
+  own <- submit feed.client $ createCmd RedStoneVerifier with
+    owner = feed.client, observers = []
+    signers = testSigners, signerCountThreshold = 3, feedIds = ["BTC", "ETH"]
+    attestationKeys
+    maxBehind = hours 1, maxAhead = minutes 5
+  submit feed.client $ exerciseCmd (toInterfaceContractId @Api.Verifier own) Api.Verifier_VerifyRound with
+    actor = feed.client, capsule = capsule feed (content feed payloadFull), round
 
 -- | The verify is reported as rejected, with at least one reason, and the
 -- transaction itself succeeds.
@@ -179,11 +215,9 @@ testVerifiesFullPayload = do
   let c = content feed payloadFull
   (ownVerifier, result) <- verifyAsClient feed c
   result === Api.Verified expectedDataHash
+  round <- attest feed (capsuleRound feed)
   canonical <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
-    actor = feed.client, capsule = capsule feed c
-    round = Api.RoundView with
-      definition = feed.definition, roundNumber = 1
-      timestamp = fixingTime, dataHash = expectedDataHash
+    actor = feed.client, capsule = capsule feed c, round
   canonical === Api.Passed
 
 testRejectsBelowThreshold : Script ()
@@ -253,38 +287,110 @@ testRejectsWrongRound = do
   feed <- setup
   let c = content feed payloadFull
   (ownVerifier, _) <- verifyAsClient feed c
-  wrongNumber <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
-    actor = feed.client, capsule = capsule feed c
-    round = Api.RoundView with
-      definition = feed.definition, roundNumber = 2
-      timestamp = fixingTime, dataHash = expectedDataHash
+  let round = capsuleRound feed
+      -- Each wrong round is attested as such, so only the field is reported.
+      check wrong = do
+        attested <- attest feed wrong
+        submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+          actor = feed.client, capsule = capsule feed c, round = attested
+  wrongNumber <- check round with roundNumber = 2
   wrongNumber === Api.Failed ["round number mismatch"]
-  wrongTime <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
-    actor = feed.client, capsule = capsule feed c
-    round = Api.RoundView with
-      definition = feed.definition, roundNumber = 1
-      timestamp = addRelTime fixingTime (seconds 1), dataHash = expectedDataHash
+  wrongTime <- check round with timestamp = addRelTime fixingTime (seconds 1)
   wrongTime === Api.Failed ["round timestamp differs from the fixing time"]
-  wrongHash <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
-    actor = feed.client, capsule = capsule feed c
-    round = Api.RoundView with
-      definition = feed.definition, roundNumber = 1, timestamp = fixingTime, dataHash = "00"
+  wrongHash <- check round with dataHash = "00"
   wrongHash === Api.Failed ["round commitment mismatch"]
+
+testRejectsUnattestedRound : Script ()
+testRejectsUnattestedRound = do
+  feed <- setup
+  let c = content feed payloadFull
+  (ownVerifier, _) <- verifyAsClient feed c
+  let round = capsuleRound feed
+      check attestation = submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+        actor = feed.client, capsule = capsule feed c, round = round with attestation
+  missing <- check None
+  missing === Api.Failed ["round carries no attestation"]
+  foreign <- secp256k1generatekeypair
+  signature <- secp256k1signWithEcdsaOnly foreign.privateKey (attestationMessage round)
+  forged <- check (Some signature)
+  forged === Api.Failed ["round attestation matches no key"]
+  -- A signature over another round's fields does not carry over.
+  other <- attest feed round with roundNumber = 2
+  replayed <- check other.attestation
+  replayed === Api.Failed ["round attestation matches no key"]
+
+-- | An attestation key checks in every form `signers` may take: the 65-byte
+-- point, the 64-byte X||Y without the 04 prefix, and DER (SPKI) in either
+-- case.
+testAcceptsAttestationKeyFormats : Script ()
+testAcceptsAttestationKeyFormats = do
+  feed <- setup
+  round <- attest feed (capsuleRound feed)
+  let der = feed.attester.publicKey
+  forA_ [signersFormat feed.attester, T.drop 48 der, der, T.asciiToUpper der] $ \key -> do
+    result <- verifyRoundWith feed [key] round
+    result === Api.Passed
+
+-- | A key in no form `signers` may take fails the check instead of aborting
+-- it: not hex, too short, and DER header over a longer key. A round that
+-- also carries no attestation gets both reasons.
+testRejectsMalformedAttestationKey : Script ()
+testRejectsMalformedAttestationKey = do
+  feed <- setup
+  round <- attest feed (capsuleRound feed)
+  forA_ ["zz", T.drop 50 feed.attester.publicKey, feed.attester.publicKey <> "00"] $ \key -> do
+    result <- verifyRoundWith feed [key] round
+    result === Api.Failed ["verifier attestation key is not a public key"]
+  both <- verifyRoundWith feed ["zz"] (capsuleRound feed)
+  both === Api.Failed ["verifier attestation key is not a public key", "round carries no attestation"]
+
+-- | An attestation that is not a DER signature, a node's r‖s‖v among them,
+-- fails the check instead of aborting it; a DER envelope around no valid
+-- signature matches no key.
+testRejectsMalformedAttestation : Script ()
+testRejectsMalformedAttestation = do
+  feed <- setup
+  let round = capsuleRound feed
+      -- Key 1's signature over its package in `payloadFull`.
+      nodeSignature = "246bb043828e9ace345e79dca7f457a6029fa190d99cb2ba7ccced521ab9056a59f03d1074528012e05caf9b98f48cac66dcc8f67561658673ce1d69a6cc398c1b"
+      check signature = verifyRoundWith feed [signersFormat feed.attester] round with attestation = Some signature
+  forA_ ["zz", "30", "3006020100", nodeSignature] $ \signature -> do
+    result <- check signature
+    result === Api.Failed ["round attestation is not a DER signature"]
+  empty <- check "3006020100020100"
+  empty === Api.Failed ["round attestation matches no key"]
+
+-- | A verifier that names no attestation keys passes an unattested round and
+-- fails an attested one, whose attestation nobody could check.
+testRejectsAttestationWithoutKeys : Script ()
+testRejectsAttestationWithoutKeys = do
+  feed <- setup
+  unattested <- verifyRoundWith feed [] (capsuleRound feed)
+  unattested === Api.Passed
+  round <- attest feed (capsuleRound feed)
+  attested <- verifyRoundWith feed [] round
+  attested === Api.Failed ["round carries an attestation but the verifier names no keys"]
 
 testRejectsRoundOfAnotherDefinition : Script ()
 testRejectsRoundOfAnotherDefinition = do
   feed <- setup
   let c = content feed payloadFull
   (ownVerifier, _) <- verifyAsClient feed c
+  -- The other definition has a canonical verifier, and an attestation key,
+  -- of its own.
+  otherAttester <- secp256k1generatekeypair
+  otherVerifier <- submit feed.operator $ createCmd RedStoneVerifier with
+    owner = feed.operator, observers = []
+    signers = testSigners, signerCountThreshold = 3, feedIds = ["SOL"]
+    attestationKeys = [signersFormat otherAttester]
+    maxBehind = hours 1, maxAhead = minutes 5
   proposal <- submit feed.operator $ createCmd DefinitionProposal with
-    dataId = "SOL", operator = feed.operator, auditors = [], readers = [], verifier = feed.verifier
-    publishers = None, accepted = []
+    dataId = "SOL", operator = feed.operator, auditors = [], readers = []
+    verifier = toInterfaceContractId otherVerifier, publishers = None, accepted = []
   (otherDefinition, _) <- submit feed.operator $ exerciseCmd proposal DefinitionProposal_Finalize
+  round <- attest feed (capsuleRound feed) with definition = toInterfaceContractId otherDefinition
   result <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
-    actor = feed.client, capsule = capsule feed c
-    round = Api.RoundView with
-      definition = toInterfaceContractId otherDefinition, roundNumber = 1
-      timestamp = fixingTime, dataHash = expectedDataHash
+    actor = feed.client, capsule = capsule feed c, round
   result === Api.Failed ["round belongs to another definition"]
 
 testFreshness : Script ()
@@ -328,8 +434,9 @@ testPublishAndDistributeRedStoneRound : Script ()
 testPublishAndDistributeRedStoneRound = do
   feed <- setup
   setTime (addRelTime fixingTime (seconds 10))
+  attested <- attest feed (capsuleRound feed)
   result <- submit feed.licensee $ exerciseCmd feed.head Api.RoundHead_CreateRound with
-    actor = feed.licensee, content = content feed payloadFull
+    actor = feed.licensee, content = content feed payloadFull, attestation = attested.attestation
   Some roundView <- queryInterfaceContractId feed.reader result.round
   roundView.roundNumber === 1
   roundView.timestamp === fixingTime
@@ -337,7 +444,7 @@ testPublishAndDistributeRedStoneRound = do
 
   -- A forged payload cannot become a round.
   submitMustFail feed.licensee $ exerciseCmd result.head Api.RoundHead_CreateRound with
-    actor = feed.licensee
+    actor = feed.licensee, attestation = None
     content = (content feed payloadTampered) with
       dataPoint = dataPoint feed.operator (addRelTime fixingTime (seconds 1)) medianValues
 
@@ -353,6 +460,7 @@ testPublishAndDistributeRedStoneRound = do
   own <- submit feed.client $ createCmd RedStoneVerifier with
     owner = feed.client, observers = []
     signers = testSigners, signerCountThreshold = 3, feedIds = ["BTC", "ETH"]
+    attestationKeys = [signersFormat feed.attester]
     maxBehind = hours 1, maxAhead = minutes 5
   let ownVerifier = toInterfaceContractId @Api.Verifier own
   verified <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_Verify with
@@ -373,7 +481,7 @@ testVerifiesProductionPayload = do
   own <- submit feed.client $ createCmd RedStoneVerifier with
     owner = feed.client, observers = []
     signers = redstone_primary_prod_public_keys, signerCountThreshold = 3
-    feedIds = ["BTC", "ETH"], maxBehind = hours 1, maxAhead = minutes 5
+    feedIds = ["BTC", "ETH"], attestationKeys = [], maxBehind = hours 1, maxAhead = minutes 5
   let ownVerifier = toInterfaceContractId @Api.Verifier own
       c = Api.CapsuleContent with
         dataPoint = dataPoint feed.operator productionFixingTime productionValues

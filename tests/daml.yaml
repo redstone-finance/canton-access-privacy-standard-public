@@ -30,6 +30,3 @@ build-options:
   - --ghc-option=-Wunused-binds
   - --ghc-option=-Wunused-matches
   - --target=2.1
-  # The verifier tests sign envelopes in the script with the alpha secp256k1
-  # builtins; verification itself is the Data Standard's.
-  - -Wno-crypto-text-is-alpha

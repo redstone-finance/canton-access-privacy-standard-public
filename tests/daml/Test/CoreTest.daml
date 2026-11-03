@@ -18,6 +18,7 @@ import Caps.Core.DataDefinition
 import Caps.Core.License (License(..), License_Revoke(..))
 import Caps.Core.Round (Round(..))
 import Caps.Core.RoundHead (RoundHead(..), RoundHead_Pause(..), RoundHead_Resume(..))
+import Caps.Test.Fixtures.Settlement
 import Caps.Test.Fixtures.TestVerifier
 import DataStandard.DataPointV1
   (PublishedDataPoint, PublishedDataPoint_Fetch(..), PublishedDataPointView(..))
@@ -43,6 +44,10 @@ data Feed = Feed with
 nodesTag : Text
 nodesTag = "signed-by-nodes"
 
+-- | The secret the data producer attests rounds with, named by the verifier.
+attestationKey : Text
+attestationKey = "producer-key"
+
 -- | Bootstrap a feed: verifier, proposal accepted by both auditors,
 -- finalization, root license naming `licensee` and `publisher`. A choice can
 -- only be exercised on contracts its submitter can see, so a publisher must
@@ -61,8 +66,8 @@ setup = do
   stranger <- allocateParty "Stranger"
 
   verifierCid <- submit operator $ createCmd TestVerifier with
-    owner = operator, acceptedTag = nodesTag, observers = [reader, publisher]
-    maxBehind = hours 1, maxAhead = minutes 5
+    owner = operator, acceptedTag = nodesTag, attestationKeys = [attestationKey]
+    observers = [reader, publisher], maxBehind = hours 1, maxAhead = minutes 5
   let verifier = toInterfaceContractId @Api.Verifier verifierCid
 
   proposal0 <- submit operator $ createCmd DefinitionProposal with
@@ -105,12 +110,24 @@ contentAt feed at price = Api.CapsuleContent with
   payload = AVText nodesTag
   license = feed.rootLicense
 
--- | Publish a round at `at` on `head`, as `actor`.
+-- | Publish a round at `at` on `head`, as `actor`, attested with the data
+-- producer's key.
 publish : Feed -> Party -> ContractId Api.RoundHead -> Time -> Decimal -> Script Api.CreateRoundResult
 publish feed actor head at price = do
+  attestation <- attestationFor feed head at price
   submit actor $ exerciseCmd head Api.RoundHead_CreateRound with
     actor
     content = contentAt feed at price
+    attestation
+
+-- | The attestation of the round `head` would create at `at`: the operator
+-- reads the head for the next round number.
+attestationFor : Feed -> ContractId Api.RoundHead -> Time -> Decimal -> Script (Optional Text)
+attestationFor feed head at price = do
+  Some headView <- queryInterfaceContractId feed.operator head
+  pure $ Some $ testAttestation attestationKey Api.RoundView with
+    definition = feed.definition, roundNumber = headView.roundNumber + 1, timestamp = at
+    dataHash = testCommitment (dataPointAt feed at price), attestation = None
 
 createRootLicense : Party -> [Party] -> ContractId Api.DataDefinition -> Script (ContractId Api.License)
 createRootLicense operator licensees definition =
@@ -124,12 +141,21 @@ createRootLicense operator licensees definition =
     validUntil = None
     delegate = None)
 
+-- | A canonical verifier for another definition: a key attests the rounds
+-- of one definition only, so each definition gets an instance, and a key,
+-- of its own.
+verifierFor : Feed -> Text -> Script (ContractId Api.Verifier)
+verifierFor feed dataId = toInterfaceContractId <$> submit feed.operator (createCmd TestVerifier with
+  owner = feed.operator, acceptedTag = nodesTag, attestationKeys = [dataId <> "-key"]
+  observers = [feed.reader, feed.publisher], maxBehind = hours 1, maxAhead = minutes 5)
+
 bootstrapDefinition
   : Feed -> Text -> Optional [Party] -> Script (ContractId Api.DataDefinition, ContractId Api.RoundHead)
 bootstrapDefinition feed dataId publishers = do
+  verifier <- verifierFor feed dataId
   proposal <- submit feed.operator $ createCmd DefinitionProposal with
     dataId, operator = feed.operator, auditors = [], readers = [feed.reader, feed.publisher]
-    verifier = feed.verifier, publishers, accepted = []
+    verifier, publishers, accepted = []
   (definitionCid, headCid) <- submit feed.operator $ exerciseCmd proposal DefinitionProposal_Finalize
   pure (toInterfaceContractId definitionCid, toInterfaceContractId headCid)
 
@@ -208,17 +234,18 @@ testPublicationIsOpen = do
   -- A party with no relation to the feed cannot see the head, so it cannot
   -- exercise on it...
   submitMustFail feed.stranger $ exerciseCmd feed.head Api.RoundHead_CreateRound with
-    actor = feed.stranger, content = contentAt feed now 50000.0
+    actor = feed.stranger, content = contentAt feed now 50000.0, attestation = None
   -- ...but with the head, the verifier and the root license disclosed to
   -- it, and no round, it can publish authentic data: the authority to sign
   -- the round comes from the head, not from the caller.
   Some headDisc <- queryDisclosure feed.reader (fromInterfaceContractId @RoundHead feed.head)
   Some verifierDisc <- queryDisclosure feed.reader (fromInterfaceContractId @TestVerifier feed.verifier)
   Some licenseDisc <- queryDisclosure feed.operator (fromInterfaceContractId @License feed.rootLicense)
+  attestation <- attestationFor feed feed.head now 50000.0
   result <- submit (actAs feed.stranger <> disclose headDisc
                     <> disclose verifierDisc <> disclose licenseDisc) $
     exerciseCmd feed.head Api.RoundHead_CreateRound with
-      actor = feed.stranger, content = contentAt feed now 50000.0
+      actor = feed.stranger, content = contentAt feed now 50000.0, attestation
   Some roundView <- queryInterfaceContractId feed.reader result.round
   roundView.roundNumber === 1
 
@@ -230,7 +257,7 @@ testRejectsNonMonotonicFixingTime = do
   -- Same fixing time as the previous round: refused.
   submitMustFailWith (actAs feed.publisher) "fixing time not after the previous round" $
     exerciseCmd result.head Api.RoundHead_CreateRound with
-      actor = feed.publisher, content = contentAt feed now 50000.0
+      actor = feed.publisher, content = contentAt feed now 50000.0, attestation = None
 
 testRejectsFixingTimeOutsideWindow : Script ()
 testRejectsFixingTimeOutsideWindow = do
@@ -241,10 +268,10 @@ testRejectsFixingTimeOutsideWindow = do
       future = contentAt feed (addRelTime now (minutes 10)) 50000.0
   submitMustFailWith (actAs feed.publisher) "the verifier rejected the fixing time: [\"fixing time too far in the past\"]" $
     exerciseCmd feed.head Api.RoundHead_CreateRound with
-      actor = feed.publisher, content = stale
+      actor = feed.publisher, content = stale, attestation = None
   submitMustFailWith (actAs feed.publisher) "the verifier rejected the fixing time: [\"fixing time too far in the future\"]" $
     exerciseCmd feed.head Api.RoundHead_CreateRound with
-      actor = feed.publisher, content = future
+      actor = feed.publisher, content = future, attestation = None
 
 testRejectsInauthenticPayload : Script ()
 testRejectsInauthenticPayload = do
@@ -253,7 +280,79 @@ testRejectsInauthenticPayload = do
   submitMustFailWith (actAs feed.publisher) "the verifier rejected the content: [\"payload is not authentic\"]" $
     exerciseCmd feed.head Api.RoundHead_CreateRound with
       actor = feed.publisher
+      attestation = None
       content = (contentAt feed now 50000.0) with payload = AVText "forged"
+
+-- | Where the verifier names attestation keys, a round needs the data
+-- producer's attestation: none, or one computed with a key the verifier
+-- does not name, and the head refuses the round.
+testRejectsUnattestedRound : Script ()
+testRejectsUnattestedRound = do
+  feed <- setup
+  now <- getTime
+  submitMustFailWith (actAs feed.publisher) "the verifier rejected the round: [\"round carries no attestation\"]" $
+    exerciseCmd feed.head Api.RoundHead_CreateRound with
+      actor = feed.publisher, content = contentAt feed now 50000.0, attestation = None
+  let foreign = testAttestation "another-key" Api.RoundView with
+        definition = feed.definition, roundNumber = 1, timestamp = now
+        dataHash = testCommitment (dataPointAt feed now 50000.0), attestation = None
+  submitMustFailWith (actAs feed.publisher) "the verifier rejected the round: [\"round attestation matches no key\"]" $
+    exerciseCmd feed.head Api.RoundHead_CreateRound with
+      actor = feed.publisher, content = contentAt feed now 50000.0, attestation = Some foreign
+
+-- | The key holder signs one candidate per round number and retries with
+-- it: a publication refused while paused goes through unchanged once
+-- publication resumes, with the same attestation.
+testRetryKeepsTheCandidate : Script ()
+testRetryKeepsTheCandidate = do
+  feed <- setup
+  now <- getTime
+  attestation <- attestationFor feed feed.head now 50000.0
+  pausedCid <- submit feed.auditor1 $ exerciseCmd (fromInterfaceContractId @RoundHead feed.head)
+    RoundHead_Pause with auditor = feed.auditor1
+  submitMustFailWith (actAs feed.publisher) "publication is paused" $
+    exerciseCmd (toInterfaceContractId @Api.RoundHead pausedCid) Api.RoundHead_CreateRound with
+      actor = feed.publisher, content = contentAt feed now 50000.0, attestation
+  resumedCid <- submit feed.auditor1 $ exerciseCmd pausedCid RoundHead_Resume with auditor = feed.auditor1
+  passTime (minutes 10)
+  result <- submit feed.publisher $
+    exerciseCmd (toInterfaceContractId @Api.RoundHead resumedCid) Api.RoundHead_CreateRound with
+      actor = feed.publisher, content = contentAt feed now 50000.0, attestation
+  Some roundView <- queryInterfaceContractId feed.reader result.round
+  roundView.attestation === attestation
+
+-- | A candidate signed for a round number and never published stays
+-- attested after the key holder, past the window, has signed another for
+-- the same number: what retires it is the window. A party without the
+-- round finds its attestation valid and its fixing stale.
+testStaleCandidateFailsFreshness : Script ()
+testStaleCandidateFailsFreshness = do
+  feed <- setup
+  first <- getTime
+  staleAttestation <- attestationFor feed feed.head first 50000.0
+  -- Publication fails for longer than the window; the key holder signs a
+  -- new candidate for the same number and that one becomes the round.
+  passTime (hours 1 + minutes 6)
+  second <- getTime
+  result <- publish feed feed.publisher feed.head second 50100.0
+  Some roundView <- queryInterfaceContractId feed.reader result.round
+  roundView.timestamp === second
+  let staleCapsule = Api.CapsuleView with
+        definition = feed.definition, roundNumber = 1, content = contentAt feed first 50000.0
+      staleView = Api.RoundView with
+        definition = feed.definition, roundNumber = 1, timestamp = first
+        dataHash = testCommitment (dataPointAt feed first 50000.0), attestation = staleAttestation
+  ownCid <- submit feed.client1 $ createCmd TestVerifier with
+    owner = feed.client1, acceptedTag = nodesTag, attestationKeys = [attestationKey]
+    observers = [], maxBehind = hours 1, maxAhead = minutes 5
+  let own = toInterfaceContractId @Api.Verifier ownCid
+  canonical <- submit feed.client1 $ exerciseCmd own Api.Verifier_VerifyRound with
+    actor = feed.client1, capsule = staleCapsule, round = staleView
+  canonical === Api.Passed
+  now <- getTime
+  fresh <- submit feed.client1 $ exerciseCmd own Api.Verifier_VerifyFreshness with
+    actor = feed.client1, capsule = staleCapsule, asOf = now
+  fresh === Api.Failed ["fixing time too far in the past"]
 
 testRejectsForeignLicense : Script ()
 testRejectsForeignLicense = do
@@ -269,6 +368,7 @@ testRejectsForeignLicense = do
   submitMustFailWith (actAs feed.publisher) "root license must be owned by the operator" $
     exerciseCmd feed.head Api.RoundHead_CreateRound with
       actor = feed.publisher
+      attestation = None
       content = (contentAt feed now 50000.0) with license = toInterfaceContractId foreignCid
 
 testRejectsLicenseOfAnotherDefinition : Script ()
@@ -280,6 +380,7 @@ testRejectsLicenseOfAnotherDefinition = do
   submitMustFailWith (actAs feed.publisher) "license belongs to another definition" $
     exerciseCmd feed.head Api.RoundHead_CreateRound with
       actor = feed.publisher
+      attestation = None
       content = (contentAt feed now 50000.0) with license
 
 testRejectsDataPointOfAnotherDistributor : Script ()
@@ -290,6 +391,7 @@ testRejectsDataPointOfAnotherDistributor = do
   submitMustFailWith (actAs feed.publisher) "root capsule must be distributed by the operator" $
     exerciseCmd feed.head Api.RoundHead_CreateRound with
       actor = feed.publisher
+      attestation = None
       content = (contentAt feed now 50000.0) with dataPoint
 
 testRejectsPublisherNotAdmitted : Script ()
@@ -302,6 +404,7 @@ testRejectsPublisherNotAdmitted = do
   submitMustFailWith (actAs feed.publisher) "publisher not admitted" $
     exerciseCmd head Api.RoundHead_CreateRound with
       actor = feed.publisher
+      attestation = None
       content = (contentAt feed now 50000.0) with license
 
 testRaceOnHead : Script ()
@@ -311,7 +414,7 @@ testRaceOnHead = do
   _ <- publish feed feed.publisher feed.head now 50000.0
   -- A second publication against the consumed head fails entirely.
   submitMustFail feed.publisher $ exerciseCmd feed.head Api.RoundHead_CreateRound with
-    actor = feed.publisher, content = contentAt feed (addRelTime now (minutes 1)) 50100.0
+    actor = feed.publisher, content = contentAt feed (addRelTime now (minutes 1)) 50100.0, attestation = None
 
 testPauseAndResume : Script ()
 testPauseAndResume = do
@@ -322,7 +425,7 @@ testPauseAndResume = do
   let paused = toInterfaceContractId @Api.RoundHead pausedCid
   submitMustFailWith (actAs feed.publisher) "publication is paused" $
     exerciseCmd paused Api.RoundHead_CreateRound with
-      actor = feed.publisher, content = contentAt feed now 50000.0
+      actor = feed.publisher, content = contentAt feed now 50000.0, attestation = None
   -- A reader sees the head but is no auditor, so it cannot resume.
   submitMustFailWith (actAs feed.reader) "not an auditor" $
     exerciseCmd pausedCid RoundHead_Resume with auditor = feed.reader
@@ -335,9 +438,10 @@ testPauseAndResume = do
 testProposalCanBeCancelled : Script ()
 testProposalCanBeCancelled = do
   feed <- setup
+  verifier <- verifierFor feed "ETH/USD"
   let newProposal = submit feed.operator $ createCmd DefinitionProposal with
         dataId = "ETH/USD", operator = feed.operator, auditors = [feed.auditor1, feed.auditor2]
-        readers = [feed.reader], verifier = feed.verifier, publishers = None, accepted = []
+        readers = [feed.reader], verifier, publishers = None, accepted = []
   proposal0 <- newProposal
   proposal1 <- submit feed.auditor1 $ exerciseCmd proposal0 DefinitionProposal_Accept with auditor = feed.auditor1
   -- Once an auditor has accepted, the operator cannot archive the proposal
@@ -437,6 +541,40 @@ distributionFixture = do
     actor = feed.licensee, licenseType = AVText "redistribution", licensees = [feed.client1]
   pure (feed, rootView, sublicense, result)
 
+-- | A counterparty that consented in advance: Bob, who is not a reader,
+-- signs a settlement Alice settles alone, on a capsule and a round view she
+-- supplies. The contract accepts the round's view as the ledger carries it
+-- and refuses an authentic capsule with a view nothing attested, or with
+-- the round's attestation over another commitment: which authentic
+-- payload is the round is the key holder's choice, not Alice's.
+testSettlementOnSuppliedView : Script ()
+testSettlementOnSuppliedView = do
+  (feed, rootView, sublicense, result) <- distributionFixture
+  capsule <- submit feed.licensee $ exerciseCmd sublicense Api.License_Distribute with
+    source = Api.ByView rootView, clients = [feed.client1]
+  Some capsuleView <- queryInterfaceContractId feed.client1 capsule
+  Some roundView <- queryInterfaceContractId feed.reader result.round
+  -- Bob pins the parameters in an instance of his own that Alice exercises.
+  verifierCid <- submit feed.client2 $ createCmd TestVerifier with
+    owner = feed.client2, acceptedTag = nodesTag, attestationKeys = [attestationKey]
+    observers = [feed.client1], maxBehind = hours 1, maxAhead = minutes 5
+  settlement <- submit (actAs feed.client1 <> actAs feed.client2) $ createCmd Settlement with
+    a = feed.client1, b = feed.client2, verifier = toInterfaceContractId verifierCid
+  -- Another authentic payload for the round, with a view that agrees with it.
+  let other = capsuleView with content = contentAt feed roundView.timestamp 51000.0
+      otherView = roundView with
+        dataHash = testCommitment other.content.dataPoint, attestation = None
+  submitMustFailWith (actAs feed.client1) "not canonical: [\"round carries no attestation\"]" $
+    exerciseCmd settlement Settlement_Settle with capsule = other, round = otherView
+  submitMustFailWith (actAs feed.client1) "not canonical: [\"round attestation matches no key\"]" $
+    exerciseCmd settlement Settlement_Settle with
+      capsule = other, round = otherView with attestation = roundView.attestation
+  settled <- submit feed.client1 $ exerciseCmd settlement Settlement_Settle with
+    capsule = capsuleView, round = roundView
+  Some record <- queryContractId feed.client2 settled
+  record.roundNumber === roundView.roundNumber
+  record.dataPoint === capsuleView.content.dataPoint
+
 testDistributeByView : Script ()
 testDistributeByView = do
   (feed, rootView, sublicense, _) <- distributionFixture
@@ -493,8 +631,8 @@ testConsumerVerifiesDistributedCapsule = do
   -- against a verifier instance of its own.
   Some roundView <- queryInterfaceContractId feed.reader result.round
   ownVerifierCid <- submit feed.client1 $ createCmd TestVerifier with
-    owner = feed.client1, acceptedTag = nodesTag, observers = []
-    maxBehind = hours 1, maxAhead = minutes 5
+    owner = feed.client1, acceptedTag = nodesTag, attestationKeys = [attestationKey]
+    observers = [], maxBehind = hours 1, maxAhead = minutes 5
   let ownVerifier = toInterfaceContractId @Api.Verifier ownVerifierCid
   verified <- submit feed.client1 $ exerciseCmd ownVerifier Api.Verifier_Verify with
     actor = feed.client1, capsule = capsuleView
@@ -502,6 +640,12 @@ testConsumerVerifiesDistributedCapsule = do
   canonical <- submit feed.client1 $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
     actor = feed.client1, capsule = capsuleView, round = roundView
   canonical === Api.Passed
+  -- The view as a party that cannot read the round would receive it from
+  -- the capsule's presenter: the attestation is what makes it checkable,
+  -- and without it the check fails.
+  unattested <- submit feed.client1 $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+    actor = feed.client1, capsule = capsuleView, round = roundView with attestation = None
+  unattested === Api.Failed ["round carries no attestation"]
   -- A capsule claiming another round is reported, not aborted on.
   let lying = capsuleView with roundNumber = 7
   rejected <- submit feed.client1 $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with

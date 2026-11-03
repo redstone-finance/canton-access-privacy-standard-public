@@ -1,0 +1,57 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | A settlement between two parties, for the tests of a consumer that uses
+-- a capsule in a transaction with another party. `a` settles alone, on a
+-- capsule and a round view it supplies, and the contract runs the
+-- verifier's checks on them before it settles. `b` consented when it signed
+-- the contract and has no later moment to compare the view with the round
+-- on its own participant, so the round's attestation is what it relies on.
+module Caps.Test.Fixtures.Settlement where
+
+import qualified Caps.Api.CoreV1 as Api
+import DataStandard.DataPointV1 (PublishedDataPointView)
+
+template Settlement
+  with
+    a : Party
+    b : Party
+    verifier : ContractId Api.Verifier
+      -- ^ An instance with the parameters both parties pinned, visible to
+      -- `a`, who exercises it.
+  where
+    signatory a, b
+
+    -- | Settle on `capsule` at `round`: authentic, canonical (attestation
+    -- included) and fresh at ledger time, or the transaction fails.
+    choice Settlement_Settle : ContractId Settled
+      with
+        capsule : Api.CapsuleView
+        round : Api.RoundView
+      controller a
+      do
+        authentic <- exercise verifier Api.Verifier_Verify with actor = a, capsule
+        case authentic of
+          Api.Verified _ -> pure ()
+          Api.Rejected reasons -> abort $ "not authentic: " <> show reasons
+        require "not canonical" =<< exercise verifier Api.Verifier_VerifyRound with
+          actor = a, capsule, round
+        now <- getTime
+        require "not fresh" =<< exercise verifier Api.Verifier_VerifyFreshness with
+          actor = a, capsule, asOf = now
+        create Settled with a, b, roundNumber = round.roundNumber, dataPoint = capsule.content.dataPoint
+
+-- | What a settlement records.
+template Settled
+  with
+    a : Party
+    b : Party
+    roundNumber : Int
+    dataPoint : PublishedDataPointView
+  where
+    signatory a, b
+
+-- | Abort with `what` and the reasons unless the check passed.
+require : Text -> Api.CheckResult -> Update ()
+require _ Api.Passed = pure ()
+require what (Api.Failed reasons) = abort $ what <> ": " <> show reasons

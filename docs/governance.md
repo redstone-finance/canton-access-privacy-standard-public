@@ -50,14 +50,14 @@ Canton's topology (variant E).
 ### A publication
 
 An admitted publisher exercises `RoundHead_CreateRound`. The transaction
-fetches the root license (through its interface), exercises
-`Verifier_Verify` and `Verifier_VerifyFreshness` on the canonical verifier,
-and creates the round, the successor head and the root capsule; the
-previous round's number and fixing time come from the head itself, so no
-round is fetched. The publisher must see three contracts: the head, the
-verifier and the root license, by observation or by explicit disclosure.
-The participants of the operator and of every auditor confirm, because they
-sign the head and the round.
+fetches the root license (through its interface), exercises `Verifier_Verify`,
+`Verifier_VerifyFreshness` and `Verifier_VerifyRound` on the canonical
+verifier, and creates the round, the successor head and the root capsule; the
+previous round's number and fixing time come from the head itself, so no round
+is fetched. The publisher must see three contracts: the head, the verifier and
+the root license, by observation or by explicit disclosure. The participants of
+the operator and of every auditor confirm, because they sign the head and the
+round.
 
 ### Pause
 
@@ -76,6 +76,7 @@ operator can neither pause nor resume.
 | Blocking by a single auditor | possible | The outage or boycott of one auditor's participant stops publication, and so does one pause. |
 | Blocking by the operator | possible | Through its own participant. Does not affect distribution or consumption of existing capsules, where the operator is no party. |
 | Dependence on data production | outside the model | The oracle's nodes sign independently of the operator; CAPS liveness concerns the step on the ledger. |
+| Dependence on the attestation key | outside the model, where rounds are attested | The key is the data producer's, and a producer that does not sign a candidate has not produced the round; publishers carry the signed candidate and cannot replace it. The signer is a small component off the ledger path, to be made available on its own. |
 
 ### Actors
 
@@ -85,7 +86,7 @@ operator can neither pause nor resume.
 | One auditor, malicious | no | yes, by its node or by a pause | can resume another auditor's pause |
 | Operator and every auditor, colluding | yes | yes | full control; the model's boundary |
 | Outage of any signatory's node | | yes, until the node returns; transactions time out, nothing is lost | mitigation: multi-hosting |
-| Another publisher | no | no | publishes without the operator if it sees the three contracts |
+| Another publisher | no | no | publishes without the operator if it sees the three contracts; where rounds are attested, carries the producer's signed candidate |
 | A consumer | no | no | verifies locally on its own verifier instance |
 
 ## Variants
@@ -224,6 +225,10 @@ topology transaction. The pattern of the DSO party in Splice.
   repository.
 - Requires: `caps-core` choices with thresholds for revocation, pause,
   publishers and readers; topology procedures; a DevNet demonstration.
+- Attestation: a single key would reintroduce the point of blocking this
+  variant removes. E either attests with a threshold of the namespace owners'
+  keys, packed into `attestation` by a verifier whose encoding requires m of n,
+  or does not attest and keeps canonicality by reading.
 - Use when: the feed has genuinely multi-party governance in which no
   organisation may stop or fork the chain alone. A candidate for a later
   milestone, to be tried on DevNet first.

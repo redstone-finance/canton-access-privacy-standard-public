@@ -36,6 +36,7 @@ cannot verify what it receives.
      signers = canonical.signers
      signerCountThreshold = canonical.signerCountThreshold
      feedIds = canonical.feedIds
+     attestationKeys = canonical.attestationKeys
      maxBehind = canonical.maxBehind, maxAhead = canonical.maxAhead
    let ownVerifier = toInterfaceContractId @Api.Verifier ownVerifierCid
    ```
@@ -60,9 +61,13 @@ the way it reads any data point. What follows is what CAPS adds.
 
 ## The five checks
 
-Run the first three inside one transaction if you use the data in a
-transaction with other parties: every informee's participant re-executes
-them, so your counterparties need not trust your reading.
+Run the first three inside one transaction if you use the data in a transaction
+with other parties: every informee's participant re-executes them. Authenticity
+and freshness carry over as they are; canonicality, inside the transaction,
+only as the key holder's word, through the round's attestation, since the round
+view is an argument you supply. Outside it, a counterparty that reads the round
+compares your view with it before it consents; one that consented in advance
+relies on the attestation (see check 2).
 
 ### 1. Authenticity
 
@@ -107,6 +112,15 @@ together, since the head mutex prevents two extensions of the chain and
 every round is co-signed by the auditors ([governance.md](governance.md)).
 Report it to the operator and the auditors and accept neither until they
 resolve it.
+
+If you cannot read the round, because you are not a reader or because the check
+runs inside a choice another party exercises, take the round view the presenter
+hands over next to the capsule and run the same check on it. `Passed` then
+means that a key the verifier names signed that content for that round number;
+`Failed ["round carries no attestation"]` or
+`["round attestation matches no key"]` means nobody did, and the view is the
+presenter's own. The feed's verifier names the keys, or none; a feed without
+attestation keys is verifiable by readers only.
 
 ### 3. Freshness
 
@@ -175,8 +189,8 @@ Three things do reveal something, and are your choice:
 
 - exercising the canonical verifier instead of your own informs the
   operator;
-- fetching the capsule or the license inside a transaction informs its
-  signatory;
+- fetching the capsule, the license or the round inside a transaction
+  informs its signatories, and they confirm it;
 - being a client of a capsule shows you its co-recipients, and them you.
 
 ## Several verifiers, several definitions

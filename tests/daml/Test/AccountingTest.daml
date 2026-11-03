@@ -65,6 +65,7 @@ setup = do
 
   verifierCid <- submit operator $ createCmd TestVerifier with
     owner = operator, acceptedTag = nodesTag, observers = []
+    attestationKeys = []
     maxBehind = hours 1, maxAhead = minutes 5
   let bootstrap dataId = do
         proposal <- submit operator $ createCmd DefinitionProposal with
@@ -99,6 +100,7 @@ publishNext operator license head = do
   now <- getTime
   submit operator $ exerciseCmd head Api.RoundHead_CreateRound with
     actor = operator
+    attestation = None
     content = Api.CapsuleContent with
       dataPoint = PublishedDataPointView with
         distributor = operator, publishedAt = now, schemaVersion = "quote-1"

@@ -3,11 +3,15 @@
 
 -- | A verifier for tests, free of cryptography. A payload is authentic when
 -- it is the text `acceptedTag`; the round commitment is a SHA-256 over the
--- data point's fixing time and values; a fixing time is fresh within
--- `maxBehind` and `maxAhead` of the reference time. Enough to exercise every
--- path of the reference implementation without a signing scheme.
+-- data point's fixing time and values; a round attestation is a SHA-256
+-- over one of `attestationKeys`, shared secrets standing in for signing
+-- keys, the round number and the commitment, which carries the fixing time;
+-- a fixing time is fresh within `maxBehind` and `maxAhead` of the reference
+-- time. Enough to exercise every path of the reference implementation
+-- without a signing scheme.
 module Caps.Test.Fixtures.TestVerifier where
 
+import DA.Optional (isNone)
 import DA.Text (sha256)
 import DA.Time (RelTime, addRelTime)
 
@@ -19,6 +23,9 @@ template TestVerifier
   with
     owner : Party
     acceptedTag : Text
+    attestationKeys : [Text]
+      -- ^ Secrets a round attestation may be computed with; empty for none.
+      -- A key attests the rounds of one definition only.
     observers : [Party]
       -- ^ For the canonical instance, the readers: a publication exercises
       -- the verifier, and a contract used in a transaction must be visible
@@ -37,12 +44,12 @@ template TestVerifier
       verifier_verifyImpl _self arg = pure $ verdict (testCommitment arg.capsule.content.dataPoint)
         [ ("payload is not authentic", arg.capsule.content.payload == AVText acceptedTag) ]
 
-      verifier_verifyRoundImpl _self arg = pure $ outcome
+      verifier_verifyRoundImpl _self arg = pure $ outcome $
         [ ("round belongs to another definition", arg.round.definition == arg.capsule.definition)
         , ("round number mismatch", arg.round.roundNumber == arg.capsule.roundNumber)
         , ("round timestamp differs from the fixing time", arg.round.timestamp == arg.capsule.content.dataPoint.publishedAt)
         , ("commitment mismatch", arg.round.dataHash == testCommitment arg.capsule.content.dataPoint)
-        ]
+        ] <> attestationChecks attestationKeys arg.round
 
       verifier_verifyFreshnessImpl _self arg =
         let fixingTime = arg.capsule.content.dataPoint.publishedAt
@@ -71,3 +78,19 @@ outcome checks = case failures checks of
 -- | The test verifier's round commitment.
 testCommitment : PublishedDataPointView -> Text
 testCommitment dp = sha256 (show dp.publishedAt <> "|" <> show dp.values)
+
+-- | The test verifier's round attestation: what the key holder of `key`
+-- attaches to `round`.
+testAttestation : Text -> Api.RoundView -> Text
+testAttestation key Api.RoundView{roundNumber, dataHash} =
+  sha256 (key <> "|" <> show roundNumber <> "|" <> dataHash)
+
+-- | The attestation checks: the round must carry none when the verifier
+-- names no keys, otherwise an attestation computed with one of them.
+attestationChecks : [Text] -> Api.RoundView -> [(Api.RejectionReason, Bool)]
+attestationChecks [] round =
+  [("round carries an attestation but the verifier names no keys", isNone round.attestation)]
+attestationChecks keys round = case round.attestation of
+  None -> [("round carries no attestation", False)]
+  Some attestation ->
+    [ ("round attestation matches no key", attestation `elem` [ testAttestation key round | key <- keys ]) ]

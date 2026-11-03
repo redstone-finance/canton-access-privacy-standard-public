@@ -14,8 +14,10 @@
 --
 -- The round commitment is the keccak256 of the signed payload: a round is
 -- bound to exactly the node packages it was published from, and any RedStone
--- SDK recomputes the commitment from the payload bytes. A fixing is fresh
--- within `maxBehind` and `maxAhead` of the reference time.
+-- SDK recomputes the commitment from the payload bytes. A round attestation,
+-- where `attestationKeys` names any, is a DER signature by one of them over
+-- `attestationMessage`. A fixing is fresh within `maxBehind` and `maxAhead`
+-- of the reference time.
 module Caps.Verifier.RedStone where
 
 import DA.Time (RelTime)
@@ -25,8 +27,8 @@ import Caps.Verifier.RedStone.Internal.Verification
 
 -- | The verifier. The canonical instance belongs to the operator and must be
 -- visible to publishers through `observers`; a consumer creates its own
--- instance with the same `signers`, `signerCountThreshold`, `feedIds` and
--- window.
+-- instance with the same `signers`, `signerCountThreshold`, `feedIds`,
+-- `attestationKeys` and window.
 template RedStoneVerifier
   with
     owner : Party
@@ -38,6 +40,10 @@ template RedStoneVerifier
       -- ^ Minimum number of distinct signers per feed.
     feedIds : [Text]
       -- ^ The feeds every capsule must carry, no more and no fewer.
+    attestationKeys : [Text]
+      -- ^ Keys a round attestation may be signed with, in the format of
+      -- `signers`; empty for none. A key attests the rounds of one
+      -- definition only.
     maxBehind : RelTime
       -- ^ How far behind the reference time a fixing time may be.
     maxAhead : RelTime
@@ -55,7 +61,7 @@ template RedStoneVerifier
         verifyContent signers signerCountThreshold feedIds arg.capsule.content
 
       verifier_verifyRoundImpl _self arg =
-        pure $ verifyRound arg.capsule arg.round
+        pure $ verifyRound attestationKeys arg.capsule arg.round
 
       verifier_verifyFreshnessImpl _self arg =
         pure $ verifyFreshness maxBehind maxAhead arg.capsule arg.asOf

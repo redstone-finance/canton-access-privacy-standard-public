@@ -657,6 +657,13 @@ the verifiers among them, MAY be upgraded in place under Daml's
 smart-contract upgrade rules, which is where the executable code lives for
 that reason.
 
+That holds from version 1.0.0, which freezes `caps-api-core-v1`. Until then
+a release may change a view, a type or a choice of the package, and such a
+release is a new deployment, not an upgrade of the one before. Version
+1.0.0 freezes the package on the release of the Canton Data Standard
+current at that time; a change of `AnyValue` or `PublishedDataPoint` after
+it is a `caps-api-core-v2` as well.
+
 The interface package targets Daml-LF 2.1, the version the Canton Data
 Standard and the Splice packages target, and declares every type
 `Serializable` explicitly.

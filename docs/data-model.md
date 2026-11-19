@@ -36,8 +36,8 @@ below it.
 |---|---|---|
 | A data set | the `DataDefinition` contract id | `dataId` is a label and may repeat; the contract id is what a consumer pins and what every other contract carries. |
 | The verification rules | the canonical `Verifier` contract id in the definition's view | It names a template and its parameters. A consumer reads the contract, creates an instance of its own from the same template with the same fields, and verifies against that. |
-| A fixing | `(definition, roundNumber)` | Unique because the head is consumed on every round. The `Round` contract id is not referenced by anything. |
-| A license | its contract id | `content.license` of a capsule is the license as issued, at the time of distribution. |
+| A fixing | `(definition, roundNumber)` | Unique because the head is consumed on every round. No capsule references the `Round` contract id; the head points at the latest round. |
+| A license | its contract id | `content.license` of a capsule is the license contract `License_Distribute` was exercised on. For a license replaced on every distribution it is the contract that distribution spent, the issued one only for the first. |
 | A capsule | its contract id | Referenced by nothing in the core interfaces except, optionally, `LicenseDelegate_OnDistribute`. An extension may record it, as the accounting extension's marker does. |
 | A distributor | a `Party` | `dataPoint.distributor`, which is also the capsule's signatory, and `LicenseView.owner`. |
 
@@ -155,13 +155,15 @@ template, known to whoever creates an instance.
 | `Verifier_Verify` | `actor` | `Party` | The verifying party; sole controller. |
 | | `capsule` | `CapsuleView` | The capsule being checked, as data. |
 | `Verifier_VerifyRound` | `actor`, `capsule` | | As above. |
-| | `round` | `RoundView` | The round as read from the consumer's own participant or, for a consumer that cannot read it, as handed over next to the capsule. |
+| | `round` | `RoundView` | The round, as data: its view read from a participant hosting the reader or, for a consumer that cannot read it, handed over next to the capsule. |
 | `Verifier_VerifyFreshness` | `actor`, `capsule` | | As above. |
 | | `asOf` | `Time` | The reference time the fixing time is judged against: ledger time at publication, the time the consumer cares about otherwise. |
 | `RoundHead_CreateRound` | `actor` | `Party` | The publisher; sole controller. |
 | | `content` | `CapsuleContent` | The root capsule's content, with the root license in force for this round. |
 | | `attestation` | `Optional Text` | The signature for the round about to be created; required where the verifier names attestation keys. |
 | `Round_Archive` | `actor` | `Party` | The party retiring the round; sole controller. The authority to archive flows from the round. |
+| `Round_Fetch` | `actor` | `Party` | The party taking the round's view inside a transaction; sole controller. Any party that can see the round, by observation or by disclosure. |
+| | `signatories` | `[Party]` | The parties that sign the feed's rounds, in the reference implementation those of the definition. The choice fails unless they are exactly the round's signatories. |
 | `License_Distribute` | `source` | `CapsuleSource` | The capsule being redistributed. |
 | | `clients` | `[Party]` | Observers of the new capsule. They see each other. |
 | `License_CreateSublicense` | `actor` | `Party` | Owner of the new license; sole controller; must be one of the license's `licensees`. |
@@ -182,18 +184,19 @@ template, known to whoever creates an instance.
 
 CAPS depends on two packages of the
 [Canton Data Standard](https://github.com/kaikodata/canton-data-standard),
-version 0.2.0, vendored in `deps/`: `canton-data-standard-utils-v1` for
+version 0.3.0, vendored in `deps/`: `canton-data-standard-utils-v1` for
 `AnyValue` and `canton-data-standard-datapoint-v1` for `PublishedDataPoint`.
 The Data Standard verifier also uses `canton-data-standard-codecs` and
 `canton-data-standard-distributor-key-v1`, and the RedStone verifier the
-RedStone Daml SDK (`redstone-sdk-v20`, `redstone-common-v20`); the
+RedStone Daml SDK (`redstone-sdk-v1`, `redstone-common-v1`); the
 interfaces depend on the first two packages only.
 
 **`AnyValue`** (`DataStandard.Utils`), a tagged value:
 
 ```
 AVInt Int | AVDecimal Decimal | AVText Text | AVTime Time | AVBool Bool
-| AVList [AnyValue] | AVMap (TextMap AnyValue)
+| AVList [AnyValue] | AVMap (TextMap AnyValue) | AVParty Party
+| AVInstrumentId InstrumentId | AVDate Date | AVNull
 ```
 
 CAPS uses it for `payload`, for `licenseType` and for the delegate's
@@ -208,7 +211,7 @@ implementation defines.
 | `publishedAt` | `Time` | The fixing time. Equal to the round's `timestamp`. |
 | `schemaVersion` | `Text` | The version of the `values` schema; the distributor's, independent of the interface version. |
 | `values` | `TextMap AnyValue` | The data: field names to tagged values. For a price feed, typically the feed id and the price. |
-| `metadata` | `Metadata`, a record wrapping a `TextMap Text` in its `values` field | Annotations that are not part of the data. |
+| `metadata` | `Metadata`, a record wrapping a `TextMap Text` in its `values` field | Annotations that are not part of the data: the capsule signatory's, copied by the reference distribution, verified by nothing. |
 
 **`PublishedDataPoint`** is the interface every capsule implements. Its one
 choice, `PublishedDataPoint_Fetch`, returns the view to any `actor` that
@@ -226,9 +229,22 @@ The repository ships three.
 
 | Verifier | `payload` | `dataPoint` must be | Commitment (`dataHash`) |
 |---|---|---|---|
-| `caps-verifier-redstone` | `AVText` of a RedStone payload as the nodes sign it and the gateways serve it, hex-encoded: signed data packages, unsigned metadata, the RedStone marker | exactly the verifier's `feedIds`, each equal to the median of the quorum of packages for that feed | keccak256 of the payload bytes |
-| `caps-verifier-datastandard` | `AVMap` with `expiresAt : AVTime` and `signatures : AVList [AVText]`, each signature hex DER ECDSA over the SHA-256 of the envelope's structural root hash | the signed content: its `publishedAt`, `schemaVersion` and `values` are the envelope's | the envelope's structural root hash, the Data Standard's `canonicalHash` |
+| `caps-verifier-redstone` | `AVText` of a RedStone payload as the nodes sign it and the gateways serve it, hex-encoded: signed data packages, unsigned metadata, the RedStone marker | exactly the verifier's `feedIds`, each equal to the median of the quorum of packages for that feed, under the verifier's `schemaVersion`, at a fixing time on a whole millisecond | keccak256 of the payload bytes |
+| `caps-verifier-datastandard` | `AVMap` with `expiresAt : AVTime` and `signatures : AVList [AVText]`, each signature hex DER ECDSA over the SHA-256 of the envelope's structural root hash | the signed content: its `publishedAt`, `schemaVersion` and `values` are the envelope's, at a fixing time on a whole millisecond and not after `expiresAt` | the envelope's structural root hash, the Data Standard's `canonicalHash` |
 | `caps-tests-fixtures` (`TestVerifier`) | `AVText` equal to the configured tag; no cryptography | anything | SHA-256 over the fixing time and the values |
+
+What the commitment covers, `Verifier_VerifyRound` binds to the round; the
+other copied fields `Verifier_Verify` binds to the signed data or fixes,
+except `metadata`. The RedStone commitment covers the payload alone:
+`publishedAt` and `values` follow from its packages through the
+authenticity check, and `schemaVersion` is the verifier's. The Data
+Standard commitment covers `publishedAt`, `schemaVersion`, `values` and
+`expiresAt`, the envelope. Neither oracle signs metadata and neither
+verifier looks at it, as the Data Standard's own pull path does not: it is
+the capsule signatory's annotation, and a consumer that reads it trusts the
+distributor for it. A consumer that checks the round alone therefore
+relies on the payload bytes or on the envelope, and on nothing else in the
+capsule.
 
 Where a verifier names attestation keys, the round's `attestation` is a
 signature over `caps-round-attestation-v1|roundNumber|dataHash`, which the
@@ -261,27 +277,30 @@ implementation. The standard fixes the first column only.
 
 | Contract | Created by | Consumed or archived by | Note |
 |---|---|---|---|
-| `DefinitionProposal` | the operator, directly | `DefinitionProposal_Accept` replaces it per auditor; `DefinitionProposal_Finalize` consumes it | Not an interface; the bootstrap workflow. No cancel choice yet. |
+| `DefinitionProposal` | the operator, directly | `DefinitionProposal_Accept` replaces it per auditor; `DefinitionProposal_Finalize` consumes it; `DefinitionProposal_Cancel` abandons it | Not an interface; the bootstrap workflow. |
 | `DataDefinition` | `DefinitionProposal_Finalize` | nobody; operator and auditors would have to co-sign an archive | Lives as long as the data set. |
 | `Verifier` (canonical) | the operator, directly, before the proposal | the operator | Replacing it means a new definition. |
 | `Verifier` (consumer's) | the consumer, directly | the consumer | Private; no other party is ever informed of it. |
 | `RoundHead` | `DefinitionProposal_Finalize` (first), `RoundHead_CreateRound` (every later one), `RoundHead_Pause` and `RoundHead_Resume` | the same choices consume the predecessor | Exactly one live head per definition. |
-| `Round` | `DefinitionProposal_Finalize` (genesis), `RoundHead_CreateRound` | `Round_Archive` by the operator | Must outlive every capsule of its number. |
+| `Round` | `DefinitionProposal_Finalize` (genesis), `RoundHead_CreateRound` | `Round_Archive` by the operator | Should outlive every capsule of its number; when it goes is the round archiver's rule. |
 | `License` (root) | the operator, directly | `License_Revoke` by the licensor or the operator | A new root license may be attached at any round. |
 | `License` (sublicense) | `License_CreateSublicense` on the parent | `License_Revoke` | Refers to its licensor by party, so it survives the parent's retirement. |
-| `LicenseDelegate` | its signatory, directly; `LicenseDelegate_Subdelegate` for a sublicense | nobody | Only where an extension is in use, such as `caps-accounting`. |
+| `LicenseDelegate` | its signatory, directly; `LicenseDelegate_Subdelegate` for a sublicense | its signatories, once no live license names it | Only where an extension is in use, such as `caps-accounting`. |
 | `Capsule` (root) | `RoundHead_CreateRound` | `CapsuleArchiver_Archive` | Observers: the root license's licensees and the auditors. |
 | `Capsule` (distributed) | `License_Distribute` | `CapsuleArchiver_Archive` of its distributor | Observers: the clients. |
 
 `CapsuleArchiver` (package `caps-capsule-archiver`) is one distributor's
 archiver for one definition: it carries the distributor's authority and
 archives, for any actor that sees it, the distributor's capsules at least
-`keptRounds` rounds behind the head's latest round once `keepPeriod` has
-passed since their fixing time. `RoundArchiver` (package
+`keptRounds` rounds behind the round of its newest capsule once
+`keepPeriod` has passed since their fixing time. `RoundArchiver` (package
 `caps-round-archiver`) is the operator's archiver for one definition and
-does the same for the operator's rounds, the genesis round aside; with the
-same `keptRounds` and `keepPeriod`, a round goes no sooner than the
-capsules of its number.
+applies the same rule to the rounds, for the operator alone, counted from
+the head's latest
+round and the genesis round aside. With the same `keptRounds` and
+`keepPeriod`, a round goes no sooner than the capsules of its number of a
+distributor whose newest capsule is of the head's latest round; the
+capsules of one that has fallen behind the head outlive their rounds.
 
 ## Visibility
 
@@ -296,12 +315,17 @@ them, in [accounting.md](accounting.md) and [licensing.md](licensing.md).
 |---|---|---|
 | `DefinitionProposal` | operator, auditors that accepted | auditors |
 | `DataDefinition` | operator, auditors | readers |
-| `Verifier` (canonical) | operator | readers, as the template's `observers` |
-| `RoundHead` | operator, auditors | readers |
+| `Verifier` (canonical) | operator | readers and the publishers that publish by observation, as the template's `observers` |
+| `RoundHead` | operator, auditors | the head's observers, checked on every publication to be within the root capsule's audience |
 | `Round` | operator, auditors | readers |
 | `License` | owner | operator, licensor, licensees |
 | `Capsule` (root) | operator | root license's licensees, auditors |
 | `Capsule` (distributed) | distributor | clients |
+
+Every stakeholder of a contract sees its full signatory and observer
+lists; what that reveals, and the readers party that keeps consumers off
+them, is in [threat-model.md](threat-model.md) and
+[lifecycle.md](lifecycle.md).
 
 What follows for the roles:
 
@@ -312,15 +336,20 @@ What follows for the roles:
   the operator cannot archive the definition or the head, fork the chain or
   mint a round alone, and retires a round only through `Round_Archive`;
   observes every root capsule, so it can audit what was published;
-  sees no distributed capsule and no license.
-- **A reader** sees the definition, the canonical verifier, the head and
-  the rounds: everything needed to verify a capsule, nothing of
-  distribution.
+  sees no distributed capsule, and no license but the root license, whose
+  fetch it witnesses in every publication.
+- **A reader** sees the definition, the canonical verifier and the rounds:
+  everything needed to verify a capsule, nothing of distribution. It does
+  not observe the head: the head is consumed by every publication, and an
+  observer of a consumed contract witnesses everything the exercise
+  creates, the root capsule included. By default the reader is the readers
+  party, and consumers read as it.
 - **A licensee** of the root license observes the root license and every
-  root capsule; it sees the rounds only if it is also a reader, which it
-  must be to verify.
+  root capsule, and, where the operator names it among the head's
+  observers, the head, which it needs to publish; to verify it reads the
+  rounds as any consumer does, as the readers party.
 - **A client** sees the capsules distributed to it and its co-recipients on
-  each, and needs to be a reader to verify.
+  each, and reads the rounds as the readers party to verify.
 
 ## Invariants
 
@@ -329,11 +358,13 @@ extensions' checks are listed in [accounting.md](accounting.md) and
 [licensing.md](licensing.md).
 
 - `Capsule`: `content.dataPoint.distributor == distributor`.
-- `RoundHead_CreateRound`: not paused; the actor is admitted; the latest
-  round belongs to this definition; the fixing time is strictly after the
-  latest round's; the data point's distributor is the operator; the license
-  belongs to this definition and is owned by the operator; the canonical
-  verifier returns `Verified`, passes freshness at ledger time and passes
+- `RoundHead_CreateRound`: not paused; the actor is admitted; the fixing
+  time is strictly after the latest round's; the data point's distributor is
+  the operator; the license belongs to this definition and is owned and
+  signed by the operator; every observer of the head is in the root
+  capsule's audience, the root license's licensees and the auditors; the
+  canonical verifier
+  returns `Verified`, passes freshness at ledger time and passes
   `Verifier_VerifyRound` for the round about to be created.
 - `License_Distribute`: the license has not expired; the source belongs to
   this definition.
@@ -345,6 +376,8 @@ extensions' checks are listed in [accounting.md](accounting.md) and
   `DefinitionProposal_Cancel`: the operator, with the acceptors' authority
   from the contract.
 - `RoundHead_Pause`, `RoundHead_Resume`: the actor is an auditor.
+- `Round_Fetch`, in the interface package itself: the parties the caller
+  names are exactly the round's signatories.
 - `Round_Archive`: the actor is the operator. Nothing on the ledger depends
   on a round's existence, the latest and the genesis round included; what
   stays is the archiver's rule.

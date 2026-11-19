@@ -52,17 +52,17 @@ with the consequences section 4 describes.
 |---|---|---|
 | Operator | Publishes the data set: owns the root license and is the distributor of every root capsule. In the reference implementation it also signs the definition, the round head and the rounds. | `LicenseView.owner` of the root license, `dataPoint.distributor` of a root capsule |
 | Publisher | Submits `RoundHead_CreateRound`. The operator always is one; an implementation MAY admit others. | `RoundHead_CreateRound.actor` |
-| Readers | The parties entitled to see that a round exists and to check capsules against it. | observers of `Round` in the implementation |
+| Readers | The parties entitled to see that a round exists and to check capsules against it. By default one readers party, which consumers read as (section 4). | observers of `Round` in the implementation |
 | Distributor | The owner of a license, who signs the capsules created under it. The operator is the distributor of root capsules; every other distributor is a licensee. | `LicenseView.owner`, `dataPoint.distributor` |
 | Licensee | A party a license entitles to create a sublicense from it. On the root license, also the audience of every root capsule. | `LicenseView.licensees` |
 | Client | A party a capsule is distributed to. | `License_Distribute.clients`, observers of `Capsule` |
 | Consumer | A client that verifies a capsule before acting on it. | `Verifier_*.actor` |
-| Auditors | Parties that co-sign the definition, the round head and the rounds in the reference implementation, so that the operator cannot archive the definition or the head, fork the chain or mint a round alone, and retires a round only through `Round_Archive`; they may pause publication. Not named by the interfaces. | |
+| Auditors | Parties that co-sign the definition, the round head and the rounds in the reference implementation, so that the operator cannot archive the definition or the head, fork the chain or mint a round alone, and retires a round only through `Round_Archive`, as long as an auditor is independent of the operator ([governance.md](governance.md)); they may pause publication. Not named by the interfaces. | |
 
 The standard's privacy goal is stated in terms of these roles: **the
 operator learns who holds a license and who publishes rounds; it does not
 learn who consumes, or how much any distributor distributes.** Section 4
-lists the rules that deliver this and section 6 what the standard does not
+lists the rules that deliver this and section 7 what the standard does not
 promise.
 
 ## 3. Contracts
@@ -70,6 +70,10 @@ promise.
 Each interface is described as: what the contract is, the semantics of its
 view, the semantics of its choices, requirements on implementations, and
 what the standard leaves open.
+
+A view is what its template returns, and any template may implement an
+interface: where a check decides whose contract it holds, an implementation
+MUST go by the contract's signatories, never by its view.
 
 ### 3.1 `DataDefinition`
 
@@ -147,6 +151,15 @@ be the latest round, and how far ahead.
   depend on `content.license` or on `dataPoint.distributor`, which change
   at every level of distribution. Otherwise a distributed capsule would
   fail `Verifier_VerifyRound` against the round its root capsule created.
+- Between them, the two verdicts MUST bind every copied field but
+  `dataPoint.metadata`. `Verifier_VerifyRound` binds those the commitment
+  covers; `Verifier_Verify` MUST fix the rest, each either derived from the
+  signed data, as `values` from the signed packages, or a parameter of the
+  verifier, as a `schemaVersion` it requires. `metadata` is the capsule
+  signatory's annotation, which no oracle signs and no verifier verifies,
+  as in the Canton Data Standard; a consumer that relies on it relies on
+  the distributor. A consumer that runs `Verifier_VerifyRound` alone can
+  rely on the fields the commitment covers and on no other.
 - A verifier MUST NOT fetch or exercise another contract. A fetch informs
   the fetched contract's signatories and would reveal that the caller
   consumed something.
@@ -208,12 +221,27 @@ sign the round and the root capsule flows from the head, not from the caller.
   and the definition, signed by the operator, with
   `content.dataPoint.distributor` equal to the operator;
 - fail unless `content.license` is a license of this definition owned by the
-  operator. A different license MAY be attached each round.
+  operator and signed by it. A different license MAY be attached each
+  round.
 
 An implementation MAY restrict who may publish. The reference
 implementation admits the operator always and, when `publishers` is set,
 the parties it lists; `None` admits anyone who can see the contracts a
 publication touches.
+
+**Observers of the head.** The head is consumed by every publication, and
+an observer of a consumed contract is an informee of the exercise, so it
+witnesses everything the publication creates, the root capsule included.
+An implementation MUST keep the head's observers within the root capsule's
+audience. The readers observe the rounds, not the head: a round is
+consumed only by `Round_Archive`, beneath which an implementation does
+nothing a reader may not see (section 3.4), so a reader learns nothing
+beyond the round. The reference implementation names the head's
+observers at bootstrap (`headObservers`),
+typically the root license's licensees and the publishers among them, and
+`RoundHead_CreateRound` fails while one of them is neither a licensee of
+the root license attached nor an auditor; a publisher outside that
+audience is given the head by disclosure (section 4).
 
 **Left open.** Who signs the head and the rounds, how publication is
 paused and resumed, and who the root capsule's observers are. The
@@ -221,13 +249,16 @@ reference implementation co-signs the head and every round by the operator
 and the auditors, lets any single auditor pause or
 resume, and makes the root license's licensees plus the auditors the
 observers of every root capsule. Pausing is governance and has no standard
-choice.
+choice. A reader does not observe the head, so it cannot tell a pause from
+an outage by `isPaused`; a deployment that wants it to announces a pause
+with a contract of its own, observed by the readers, created with the
+pause and archived with the resume, with nothing beneath either.
 
 ### 3.4 `Round`
 
 The immutable, price-free record of one fixing. A consumer reads it from
-its own participant and passes the view to `Verifier_VerifyRound`; it is
-never fetched inside a consumer's transaction.
+a participant hosting the reader and passes the view to
+`Verifier_VerifyRound`; verification never fetches it.
 
 **View.** `definition`, `roundNumber`, `timestamp` (the fixing time),
 `dataHash` (the verifier's commitment to the root capsule's content) and
@@ -237,6 +268,17 @@ no attestation keys).
 
 **`Round_Archive`.** Retires the round. The controller is `actor`; the
 authority to archive the round flows from the round, not from the caller.
+
+**`Round_Fetch`.** Nonconsuming; returns the round's view inside a
+transaction. The controller is `actor`, any party that can see the round,
+by observation or by explicit disclosure. The caller names in
+`signatories` the parties that sign the feed's rounds, in the reference
+implementation those of the definition, and the choice fails unless they
+are exactly the round's: a caller that named fewer, the operator alone,
+would accept a round the operator made alone. It is how a transaction rests
+on the ledger's own round instead of a view its submitter supplies; the
+round's signatories confirm the exercise and learn of it, its observers do
+not (sections 4 and 5).
 
 **Requirements.**
 
@@ -249,6 +291,10 @@ authority to archive the round flows from the round, not from the caller.
   the view holds a commitment, never a value.
 - A round MUST be archived only by `Round_Archive`, which MUST refuse any
   actor the implementation does not admit.
+- `Round_Archive` consumes the round, so the round's observers witness
+  everything beneath it. An implementation MUST NOT do beneath it anything
+  the readers may not see. The reference implementation does nothing
+  there.
 - A round SHOULD outlive every capsule of its number, since a consumer
   checks a capsule against its round; when it may go is an archiver's rule,
   not the standard's.
@@ -402,33 +448,58 @@ contract a consuming exercise archives. Every rule below follows from this.
    the same parameters and itself as signatory; by the requirements of
    section 3.2 the verdicts are the same, and the exercise has no informee
    beyond the consumer.
-3. **A consumer reads its round from its own participant.** It is an
-   observer of the round, so it has the round's view without any
+3. **A consumer reads its round from a participant hosting the reader.**
+   The reader observes the round, so its view is had without any
    transaction; passing the view to `Verifier_VerifyRound` informs nobody.
 4. **Distribution by view is private; by id is not.** `ByView` passes the
    source capsule as data: the exercise informs the license's owner and the
    new capsule's observers, which are its `clients` and, unless the
    implementation widens them, nobody else (section 3.5), plus the
-   informees of the license's delegate, if it names one (section 3.7). `ById` makes the implementation
-   fetch the
+   informees of the license's delegate, if it names one (section 3.7).
+   `ById` makes the implementation fetch the
    source, which informs its signatory, the operator for a root capsule or
    the parent distributor otherwise, of the time of this distribution. A
    distributor that wants to keep its distributions to itself uses `ByView`.
 5. **Nothing on the consumption path touches a contract the operator
    signs.** A consumer's transaction exercises its own verifier and reads
    its own view of the round. The operator is informed of a round's
-   existence, which it created, and of nothing downstream.
+   existence, which it created, and of nothing downstream. The one
+   exception is the consumer's own choice: a transaction that exercises
+   `Round_Fetch` informs the round's signatories (section 5).
 6. **The operator is informed of licenses it observes.** In the reference
-   implementation the operator observes every license at every level, so it
-   learns who holds a license, which section 2 states as accepted.
+   implementation the operator observes every license at every level, a
+   consumable or credit one through its grant, so it learns who holds a
+   license, which section 2 states as accepted.
 7. **A license's delegate is informed of its distributions.** Its
    signatories learn of every distribution that calls it, so a delegate
    that must not widen the audience of a distribution is signed by the
    distributor.
 8. **Disclosure informs the recipient only.** Showing a contract to a party
-   through explicit disclosure creates no ledger event. A publisher that is
-   not a reader can be given the contracts a publication touches this way;
-   a client can be shown the license a capsule names.
+   through explicit disclosure creates no ledger event. A publisher that
+   does not observe the head can be given the contracts a publication
+   touches this way; a client can be shown the license a capsule names.
+9. **An observer of a consumed contract witnesses the exercise in full.**
+   The informees of a consuming exercise see every node beneath it. The
+   head is consumed by every publication, so its observers see every root
+   capsule, and the reference keeps them within the root capsule's
+   audience (section 3.3); the readers observe the rounds, which are
+   created, fetched without being consumed and retired with nothing
+   beneath that they may not see (section 3.4), and see nothing of their
+   use.
+10. **Stakeholders see each other.** Every stakeholder of a contract sees
+    its full signatory and observer lists: the readers see each other on
+    every round, the root license's licensees on every root capsule, the
+    clients of one distributed capsule on it. A party-to-participant
+    mapping is visible to every member of the synchronizer, so a party
+    hosted on a consumer's participant names that consumer to everyone. A
+    deployment SHOULD therefore make the readers one public party,
+    multi-hosted with observation permission on participants that no
+    consumer operates, and SHOULD distribute one capsule per client. A
+    consumer reads the rounds as that party and passes their views to its
+    verifier; inside a transaction it reaches a round disclosed to it
+    through `Round_Fetch`, a plain fetch being open to stakeholders only.
+    A deployment MAY name consumers as readers directly where the list of
+    them is not confidential.
 
 The consequence for roles: the party acting as operator MUST NOT also act
 as a client's verifier owner or, where an extension such as accounting
@@ -440,18 +511,20 @@ the rules above keep from the operator.
 A consumer that received a capsule, as a `Capsule` or as a
 `PublishedDataPoint`, accepts it only after the checks below. The first three
 are exercises on the consumer's own verifier instance; the fourth and fifth are
-readings of contracts and events the consumer already sees.
+readings of contracts and events the consumer sees or is shown.
 
 1. **Authenticity.** `Verifier_Verify` with the capsule's view MUST return
    `Verified`. The consumer MAY record the returned `dataHash`.
 2. **Canonicality.** `Verifier_VerifyRound` with the capsule's view and the
    view of the round of the capsule's `roundNumber` for the capsule's
-   `definition` MUST return `Passed`. A reader takes the view from its own
-   participant. A consumer that cannot read the round, because it is not a
-   reader or because the check runs inside a choice another party exercises,
-   takes the view the presenter hands over next to the capsule; where the
-   verifier names no attestation keys, such a consumer SHOULD NOT accept the
-   capsule.
+   `definition` MUST return `Passed`. A consumer that reads as a reader
+   takes the view from a participant hosting the reader. A consumer that
+   cannot read the round, because it is not a reader or because the check
+   runs inside a choice another party exercises, takes the view the
+   presenter hands over next to the capsule; where the verifier names no
+   attestation keys, such a consumer SHOULD NOT accept the capsule. A
+   transaction that is to rest on the ledger's own round takes the view
+   through `Round_Fetch` (below).
 3. **Freshness.** `Verifier_VerifyFreshness` with the time the consumer
    cares about MUST return `Passed`, or the consumer applies a policy of its
    own to `content.dataPoint.publishedAt`. The oracle's window is the one
@@ -464,7 +537,6 @@ readings of contracts and events the consumer already sees.
    license is the standard's `LicenseView` plus whatever the template it
    recognises adds; [licensing.md](licensing.md) describes what the reference
    templates let a client check.
-
 5. **Chain.** The round's signatories, as the Ledger API reports them to
    the consumer, SHOULD be the signatories of the definition the consumer
    pinned. In the reference implementation both are the operator and the
@@ -478,21 +550,37 @@ readings of contracts and events the consumer already sees.
 A consumer that uses the capsule in a transaction with other parties performs
 the authenticity, canonicality and freshness checks inside that transaction:
 every informee's participant re-executes them, so the counterparties need not
-trust the consumer's reading of authenticity and freshness. Inside the
-transaction canonicality carries over only through the attestation: the
-`RoundView` is an argument the submitter supplies, and nothing inside the
-transaction ties it to a `Round` on the ledger, so a counterparty that
+trust the consumer's reading of authenticity and freshness. Where the
+`RoundView` is an argument the submitter supplies, canonicality carries over
+only through the attestation: nothing inside the transaction ties the view
+to a `Round` on the ledger, so a counterparty that
 re-executes `Verifier_VerifyRound` learns that the view and the capsule agree
 and, where the feed attests its rounds, that the key holder designated that
 content for that round number. Outside the transaction, a counterparty that
 reads the round compares the view with it before it consents; one that
 consented in advance, to a choice the other may exercise alone later, relies on
-the attestation. Fetching the round inside the transaction would tie the view
-to the ledger itself, at a cost: the round's signatories confirm the fetch, so
-the settlement depends on their participants, and they learn which readers used
-which round and when. The license check cannot be performed inside a
-transaction without fetching the license, which informs its owner; a consumer
-that needs it proven to a counterparty discloses the license contract instead.
+the attestation. Taking the view inside the transaction through `Round_Fetch`,
+on a round the submitter observes or was disclosed and with the parties that
+sign the feed's rounds named, ties it to the ledger itself, at a cost: the
+round's signatories confirm the exercise, so the settlement depends on their
+participants, and they learn who used which round and when. The license check
+cannot be performed inside a transaction without fetching the license, which
+informs its owner; a consumer that needs it proven to a counterparty discloses
+the license contract instead.
+
+**Which round.** The checks establish that a capsule is the content of
+its round and that the round is fresh, not that it is the round a
+transaction was meant to use: freshness admits every round of its window.
+A contract that lets one party settle on a capsule SHOULD fix the round by
+a rule its parties agreed, a round number, a fixing time, or the first
+round fixed at or after a time, and hold the round's view to it.
+
+**Handoffs outside the ledger.** A presentation of a capsule to a party
+that does not read it from the ledger MUST carry the capsule's view and
+the view of its round, attestation included. How it travels is outside
+the standard. [off-ledger.md](off-ledger.md) lists every handoff this
+procedure and the publisher's rely on, and what a party can check from
+each without a participant.
 
 ## 6. The publisher's procedure
 
@@ -504,9 +592,9 @@ three existing contracts: the head, the canonical verifier and the root
 license; the head carries the latest round's number and fixing time, so no
 round is fetched and retiring one never stops publication. Publishing is
 therefore open to whoever sees all three: the operator and the root
-license's licensees by observation, provided the verifier's template makes
-the readers observers of the canonical instance, and anyone else by
-explicit disclosure of the three contracts.
+license's licensees the head names among its observers by observation,
+provided the canonical verifier names them among its observers too, and
+anyone else by explicit disclosure of the three contracts.
 
 A publisher that loses the race on the head gets a failed submission and
 nothing is created; it re-reads the head and submits again with the same or a
@@ -533,7 +621,7 @@ head or a stale fixing, shows nothing.
 
 The standard proves two things to a consumer, authenticity and
 canonicality, and polices or leaves open everything else.
-[threat-model.md](threat-model.md) is the full account; the three entries
+[threat-model.md](threat-model.md) is the full account; the four entries
 that every implementer and consumer should know are these.
 
 - **A capsule can be created directly.** A capsule template signed by its
@@ -543,7 +631,8 @@ that every implementer and consumer should know are these.
   co-signatory of the capsule, would see the capsule's audience, so the
   standard forgoes it.
 - **License provenance is policed, not proven.** The standard's
-  `LicenseView` carries owner, definition and licensees; whether a license
+  `LicenseView` carries owner, definition, licensees and delegate; whether
+  a license
   was issued through the chain is visible to the parties the implementation
   makes observers of it and known to the licensor it names, not provable to
   a consumer from the interface alone.
@@ -560,7 +649,8 @@ that every implementer and consumer should know are these.
 
 An interface package can never be smart-contract-upgraded, so
 `caps-api-core-v1` holds views, data types and choices whose bodies are
-single method calls, and no logic. A change to any view, type or choice
+single method calls, and no logic beyond the check of signatories in
+`Round_Fetch`. A change to any view, type or choice
 signature is a new interface package, `caps-api-core-v2`, which a deployment
 adopts by implementing both for the transition. Implementation packages,
 the verifiers among them, MAY be upgraded in place under Daml's

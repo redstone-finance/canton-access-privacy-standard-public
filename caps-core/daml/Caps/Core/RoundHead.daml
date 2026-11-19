@@ -8,10 +8,16 @@
 -- A publication touches three existing contracts: the head it consumes, the
 -- verifier and the root license. Every contract used in a transaction must
 -- be visible to the submitter's participant, so publishing is open to
--- whoever sees all three: the operator and the root license's licensees by
--- observation (provided the verifier's template makes the readers
--- observers), anyone else by explicit disclosure. Where the verifier names
--- attestation keys, a publisher also needs an attestation by one of them.
+-- whoever sees all three: the operator and the head's observers by
+-- observation (provided the verifier's template makes them observers too),
+-- anyone else by explicit disclosure. Where the verifier names attestation
+-- keys, a publisher also needs an attestation by one of them.
+--
+-- The head is consumed by every publication, and an observer of a consumed
+-- contract is an informee of the exercise and witnesses everything under
+-- it, the root capsule included. The head's observers are therefore kept
+-- within the root capsule's audience; the readers observe the rounds, not
+-- the head.
 -- The root license is read through its interface only, so any License
 -- implementation can serve as the root license. The head carries the
 -- latest round's number and fixing time itself, so no round is fetched:
@@ -41,15 +47,21 @@ template RoundHead
       -- through this choice, so they act only at bootstrap; the operator
       -- alone cannot archive the head or mint a parallel chain.
     readers : [Party]
+      -- ^ The observers of every round. They do not observe the head.
+    observers : [Party]
+      -- ^ Who sees the head and, with it, every publication in full. Checked
+      -- on every publication to be within the root capsule's audience: the
+      -- root license's licensees and the auditors.
     verifier : ContractId Api.Verifier
       -- ^ The definition's canonical verifier, exercised on every round. Its
-      -- template MUST make the readers observers, or publishers cannot use it.
+      -- template MUST make the head's observers observers, or publishers
+      -- cannot use it.
     publishers : Optional [Party]
       -- ^ Parties admitted to publish besides the operator, who always is.
       -- None means anyone; Some [] means the operator only.
   where
     signatory operator, auditors
-    observer readers
+    observer observers
 
     interface instance Api.RoundHead for RoundHead where
       view = Api.RoundHeadView with definition, round, roundNumber, isPaused
@@ -68,11 +80,19 @@ template RoundHead
         -- The root license: this definition's, owned by the operator. Its
         -- licensees are the root capsule's audience. Read through the
         -- interface, so any License implementation can be the root license.
-        license <- view <$> fetch arg.content.license
+        licenseContract <- fetch arg.content.license
+        let license = view licenseContract
         assertMsg "license belongs to another definition" $
           license.definition == definition
         assertMsg "root license must be owned by the operator" $
           license.owner == operator
+        assertMsg "root license is not signed by the operator" $
+          operator `elem` signatory licenseContract
+        -- Every observer of the head witnesses this publication in full, so
+        -- each must be in the root capsule's audience.
+        let audience = license.licensees ++ auditors
+        assertMsg "head observer outside the root capsule's audience" $
+          all (`elem` audience) observers
 
         let newNumber = roundNumber + 1
             capsuleView = Api.CapsuleView with

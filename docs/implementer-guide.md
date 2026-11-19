@@ -15,7 +15,9 @@ requirements; this document is the order of work.
 | A deployment with its own governance, licensing or accounting | the templates you need, implementing the interfaces | the interface package, and whatever of `caps-core` still fits |
 
 In every case the interface package `caps-api-core-v1` is taken as is: it
-is what consumers and other implementers code against.
+is what consumers and other implementers code against. And in every case
+the operator names the readers at bootstrap, by default one readers party
+it has set up on read nodes beforehand ([lifecycle.md](lifecycle.md)).
 
 ## Writing a verifier
 
@@ -78,6 +80,13 @@ RedStone verifier hashes the payload bytes; the Data Standard verifier
 hashes the signed envelope, which carries no distributor. Choose what a
 third party can recompute from a capsule alone.
 
+What the commitment leaves out, your authenticity check must bind: derive
+it from the signed data, as the RedStone verifier derives `values` from the
+packages, or fix it as a parameter, as the RedStone verifier fixes the
+schema version. The one exception is `metadata`, the capsule signatory's
+annotation, which no shipped verifier looks at. Any other field bound by
+neither is a field any distributor may relabel.
+
 **`verifyRound`** compares the round view with the capsule: same definition,
 same round number, round timestamp equal to the fixing time, round `dataHash`
 equal to your commitment of the content and, where `attestationKeys` is not
@@ -89,7 +98,9 @@ the key holder computes the same bytes: the shipped verifiers sign
 keccak256 with `secp256k1WithEcdsaOnly` as the nodes sign packages, the Data
 Standard one the text itself with `secp256k1` over DER keys. A key attests the
 rounds of one definition only; say so in the verifier's documentation. Nothing
-else: do not look at ledger time, do not fetch.
+else: do not look at ledger time, do not fetch. State the commitment and the
+attestation encoding where an implementation outside Daml finds them, as
+[off-ledger.md](off-ledger.md) does for the shipped verifiers.
 
 **`verifyFreshness`** judges `dataPoint.publishedAt` against `asOf` and
 your window, inclusive at both edges. Add what your scheme knows, such as
@@ -102,9 +113,13 @@ Rules that are easy to break:
   fetch would inform a signatory that the caller consumed something.
 - Never `abort` on a bad capsule. A caller that needs failure asserts on
   the result.
-- The canonical instance needs the readers as observers: a publication
-  exercises it, and a contract used in a transaction must be visible to
-  the submitter. A consumer's instance has no observers.
+- The canonical instance needs the readers as observers, so that a consumer
+  can copy its parameters. A publisher must see it too, since a publication
+  exercises it and a contract used in a transaction must be visible to the
+  submitter: as one more observer, or by disclosure. Observers see each
+  other, so a publisher that is not to be visible to the readers is given
+  the canonical verifier by disclosure. A consumer's instance has no
+  observers.
 
 **Package wiring.** A verifier package depends on the interface DAR and
 the two Data Standard DARs as `data-dependencies`, targets LF 2.1 and sets
@@ -112,8 +127,8 @@ the two Data Standard DARs as `data-dependencies`, targets LF 2.1 and sets
 
 ```yaml
 data-dependencies:
-  - ../../deps/canton-data-standard-utils-v1-0.2.0.dar
-  - ../../deps/canton-data-standard-datapoint-v1-0.2.0.dar
+  - ../../deps/canton-data-standard-utils-v1-0.3.0.dar
+  - ../../deps/canton-data-standard-datapoint-v1-0.3.0.dar
   - ../../interfaces/caps-api-core-v1/.daml/dist/caps-api-core-v1-0.1.0.dar
 build-options:
   - --explicit-serializable=yes
@@ -133,8 +148,10 @@ produce and both edges of the freshness window.
 
 The publisher, the relayer in RedStone's terms, needs the three contracts
 a publication touches (head, canonical verifier, root license) visible on
-its participant, and a party admitted by the head's `publishers`. Then
-every round is one command:
+its participant, and a party admitted by the head's `publishers`. It sees
+the head as one of its observers, named at bootstrap and kept within the
+root capsule's audience since an observer of the head witnesses every
+publication in full, or by disclosure. Then every round is one command:
 
 ```haskell
 exerciseCmd head Api.RoundHead_CreateRound with
@@ -177,6 +194,11 @@ archives in the same transaction it publishes
 ([lifecycle.md](lifecycle.md)). Such a contract is yours, not the
 standard's, and may key, time or reward as your integration needs.
 
+A feed meant for scheduled fixings publishes its schedule: a contract that
+settles on the round fixed at an agreed time
+([specification.md](specification.md), section 5) depends on a round
+carrying exactly that time.
+
 ## Replacing parts of the reference
 
 `caps-core` is one way to satisfy the interfaces. What you may change, and
@@ -184,8 +206,9 @@ what each change touches:
 
 | You want | Change | Keeps conformance if |
 |---|---|---|
-| A different signatory policy on the head and rounds | your `RoundHead` and `Round` templates | `RoundHead_CreateRound` meets every MUST of specification §3.3; see [governance.md](governance.md) for the trade-offs |
+| A different signatory policy on the head and rounds | your `RoundHead` and `Round` templates | your templates meet every MUST of specification §3.3 and §3.4; see [governance.md](governance.md) for the trade-offs |
 | A pause by threshold | a proposal contract around `RoundHead_Pause`, or your own head | pausing stays outside the interface |
+| A pause the readers can see | a contract of your own, observed by the readers, created with the pause and archived with the resume | nothing is created beneath its archive, so the readers witness nothing else; readers still do not observe the head |
 | License kinds with terms or expiry | your `License` templates; `caps-extended-licensing` is one set | `License_Distribute` copies the content unchanged except license and distributor and makes `clients` the observers (adding any other party widens what a distribution reveals), and `License_CreateSublicense` requires a licensee |
 | Accounting, metering or another effect of a distribution | your `LicenseDelegate` template; `caps-accounting` is one | the license calls it in every distribution and sublicense, and the licensees of every license that names it observe it |
 | A capsule with extra fields (e.g. metadata of your own) | your `Capsule` template | the signatory is `content.dataPoint.distributor`, the observers are the audience, `content.dataPoint` equals the `PublishedDataPoint` view |
@@ -213,14 +236,15 @@ a root license without touching the head.
 
 ## Checklist before a release
 
-- `make ci` green: headers, build, DAR validation, tests, committed DARs
-  match a rebuild.
+- `make ci` green: headers, build, DAR validation, tests, the visibility
+  check, committed DARs match a rebuild.
 - Every verifier rejection reason covered by a test, and both edges of the
   freshness window.
 - A privacy test per claim: the operator and the auditors see no
   distributed capsule and no marker; a distribution by view informs no
   party above the distributor.
-- The canonical verifier's observers include the readers, or publishers
-  cannot publish.
+- The canonical verifier's observers include the readers, or consumers
+  cannot copy it; every publisher observes it too or is given it by
+  disclosure, or it cannot publish.
 - The documentation's visibility matrix ([data-model.md](data-model.md))
   still matches your templates.

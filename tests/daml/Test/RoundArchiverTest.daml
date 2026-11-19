@@ -45,8 +45,8 @@ keptRoundCount : Int
 keptRoundCount = 2
 
 -- | Three rounds after the genesis round, a minute apart; the ledger clock
--- stops at the third. The licensee reads the feed, so it sees the head and
--- the rounds.
+-- stops at the third. The licensee reads the feed and observes the head,
+-- so it sees the head and the rounds.
 setup : Script Feed
 setup = do
   operator <- allocateParty "Operator"
@@ -59,7 +59,7 @@ setup = do
     maxBehind = hours 1, maxAhead = minutes 5
   let bootstrap dataId = do
         proposal <- submit operator $ createCmd DefinitionProposal with
-          dataId, operator, auditors = [auditor], readers = [licensee]
+          dataId, operator, auditors = [auditor], readers = [licensee], headObservers = [licensee]
           verifier = toInterfaceContractId verifierCid, publishers = None, accepted = []
         accepted <- submit auditor $ exerciseCmd proposal DefinitionProposal_Accept with auditor
         submit operator $ exerciseCmd accepted DefinitionProposal_Finalize

@@ -1,0 +1,29 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | A capsule template of another package that breaks the standard's rule
+-- that the signatory is the data point's distributor: its view names
+-- whatever distributor its creator writes. A tool that takes a capsule's
+-- view for who signed it is fooled by one.
+module Caps.Test.Fixtures.ForeignCapsule where
+
+import qualified Caps.Api.CoreV1 as Api
+import DataStandard.DataPointV1 (PublishedDataPoint(..))
+
+template ForeignCapsule
+  with
+    owner : Party
+      -- ^ The signatory, whatever `content.dataPoint.distributor` says.
+    definition : ContractId Api.DataDefinition
+    roundNumber : Int
+    content : Api.CapsuleContent
+    observers : [Party]
+  where
+    signatory owner
+    observer observers
+
+    interface instance PublishedDataPoint for ForeignCapsule where
+      view = content.dataPoint
+
+    interface instance Api.Capsule for ForeignCapsule where
+      view = Api.CapsuleView with definition, roundNumber, content

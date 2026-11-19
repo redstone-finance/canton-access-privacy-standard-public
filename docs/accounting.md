@@ -287,8 +287,8 @@ it. The party that can tell is the licensor named on it: it signs the
 parent, so it is an informee of its own choice, and it observes the child,
 so it sees the forged one too.
 
-- Signs: distributor. Confirms: nobody beyond the distributor and the
-  clients.
+- Signs: distributor. Confirms: nobody beyond the distributor and, by id,
+  the source capsule's signatory.
 - The operator learns nothing of distribution; the accountants learn that
   and when a distribution occurred, under which license and for which round.
 - Protects against omission on the licensed path. Does not prove chain
@@ -309,6 +309,10 @@ that prefers it, none at all.
 
 - Signs and confirms: as the data model it is combined with; in the
   reference, as M3.
+- The operator learns nothing of distribution. A consumable or credit
+  license is consumed on every distribution, so nobody observes one; the
+  operator and the licensor see its `LicenseGrant`, which a distribution
+  fetches and leaves as it is ([licensing.md](licensing.md)).
 - Protects against nothing it needs to: there is no per-use charge to evade.
   A capsule created outside the license, before or after expiry, still
   evades the license's limits, and its marker can still be omitted, which
@@ -380,5 +384,7 @@ Two conventions make the audit and the client's own checks work:
 - A distributor discloses its license and delegate contracts to its
   clients, so that a client can check the license's template, owner,
   definition and delegate, the delegate's accountants, and that the
-  operator observes the license; see [licensing.md](licensing.md) for what
-  the interface alone does and does not show.
+  operator observes the license or, for a consumable or credit license,
+  the `LicenseGrant` it names, disclosed with it; see
+  [licensing.md](licensing.md) for what the interface alone does and does
+  not show.

@@ -9,14 +9,25 @@
 DAR_GLOB := interfaces/*/.daml/dist/*.dar caps-core/.daml/dist/*.dar extensions/*/.daml/dist/*.dar caps-capsule-archiver/.daml/dist/*.dar caps-round-archiver/.daml/dist/*.dar
 DAML_PKGS := $(shell find interfaces caps-core extensions caps-capsule-archiver caps-round-archiver tests-fixtures tests -name daml.yaml -not -path '*/.daml/*' -exec dirname {} \;)
 
-.PHONY: build test validate lint headers-check clean ci dars dars-check
+# Where `make test` keeps the transactions of each test for `make visibility`.
+TX_LISTINGS := tests/.daml/transactions
+TEST_MODULES := $(basename $(notdir $(wildcard tests/daml/Test/*Test.daml)))
+
+.PHONY: build test visibility validate lint headers-check clean ci dars dars-check
 
 build:
 	@if [ -f multi-package.yaml ]; then dpm build --all; else echo "build: no packages yet"; fi
 
-# Run the Daml Script test suite in-memory.
+# Run the Daml Script test suite in-memory, a module at a time, so tests of
+# the same name in two modules keep their own transaction listings.
 test:
-	@if [ -d tests ]; then cd tests && dpm test; else echo "test: no tests/ package yet"; fi
+	@if [ -d tests ]; then rm -rf $(TX_LISTINGS) && cd tests && for m in $(TEST_MODULES); do dpm test --files daml/Test/$$m.daml --transactions-output ../$(TX_LISTINGS)/$$m || exit 1; done; else echo "test: no tests/ package yet"; fi
+
+# Check who each test transaction is disclosed to, witnesses included, against
+# the privacy rules in tests/daml/Test/Visibility.daml.
+visibility: test
+	@./scripts/visibility-json.sh $(TX_LISTINGS) > $(TX_LISTINGS)/nodes.json
+	@dpm script --dar tests/.daml/dist/caps-tests-0.1.0.dar --script-name Test.Visibility:check --ide-ledger --input-file $(TX_LISTINGS)/nodes.json
 
 validate:
 	@for dar in $(DAR_GLOB); do dpm damlc validate-dar "$$dar"; done
@@ -66,4 +77,4 @@ dars-check:
 clean:
 	@if [ -f multi-package.yaml ]; then dpm clean --all; fi
 
-ci: headers-check build validate test dars-check
+ci: headers-check build validate test visibility dars-check

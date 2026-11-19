@@ -18,7 +18,7 @@ the delegate the license calls, if any.
 | Choice | Controller | Effect |
 |---|---|---|
 | `License_Distribute` | the owner | Creates a capsule for a list of clients from a source capsule, given by view, which does not fetch the source or inform its distributor, or by contract id, which fetches it and informs its signatory. The new capsule carries the same content, with the owner as distributor and this license as its license. When the license names a delegate, the distribution is reported to it in the same transaction; other informees depend on the delegate. |
-| `License_CreateSublicense` | `actor` | Creates a child license owned by `actor`, with the terms given by `licenseType` and the licensees given by `licensees`. When the license names a delegate, the child names the delegate it returns. The reference implementations require `actor` to be one of the license's licensees. |
+| `License_CreateSublicense` | `actor` | Creates a child license owned by `actor`, with the terms given by `licenseType` and the licensees given by `licensees`; a prepaid kind, which cannot be sublicensed, keeps none. When the license names a delegate, the child names the delegate it returns. The reference implementations require `actor` to be one of the license's licensees. |
 
 Two rules shape the model:
 
@@ -43,8 +43,10 @@ reference implementations police provenance instead:
   non-consuming and an observer of the parent is not informed of it, but
   the licensor named on the license is, as the parent's signatory, and
   observes the child, so it knows whether it issued it; a revoke choice
-  (`License_Revoke` in `caps-core`, `<Template>_Revoke` in the extended
-  licenses) lets the licensor or the operator retire one;
+  (`License_Revoke` in `caps-core`, `OpenLicense_Revoke` and
+  `SubscriptionLicense_Revoke` in the extended licenses, `LicenseGrant_Revoke`
+  for a consumable or credit license) lets the licensor or the operator
+  retire one;
 - a license created outside the chain that does not name the operator is
   caught only when a client is shown it and compares it with what the
   operator published.
@@ -52,7 +54,9 @@ reference implementations police provenance instead:
 What a client can check, given the license contract disclosed by its
 distributor: the template (is it one the client trusts), the owner (is it the
 capsule's distributor), the definition, the delegate, and that the operator
-observes the license. The
+observes the license. A consumable or credit license is observed by nobody:
+there the operator observes the `LicenseGrant` the license names, which the
+client can check only when the distributor discloses the grant too. The
 standard's `LicenseView` carries the owner, the definition, the licensees
 and the delegate's contract id, so the template, the observers and what the
 delegate does need the full contracts of known templates, not the
@@ -89,15 +93,29 @@ its delegate, priced by its terms. They police provenance as `caps-core`
 does, and a sublicense of any kind names the delegate its parent's
 delegate returns for it.
 
-| Template | Terms | Weight | Sublicensable |
-|---|---|---|---|
-| `OpenLicense` | open: any number of distributions, paid for by use, optionally until a `validUntil` its open sublicenses inherit | 1.0 | yes; the root license is one |
-| `ConsumableLicense` | one distribution, prepaid | 0.0 | no |
-| `SubscriptionLicense` | any number of distributions until `validUntil`, prepaid | 0.0 | no |
-| `CreditLicense` | `credits` distributions, prepaid; the contract is replaced on each, keeping the id it was issued with, which the delegate is told | 0.0 | no |
+| Template | Terms | Weight | Sublicensable | Seen by the operator and the licensor as |
+|---|---|---|---|---|
+| `OpenLicense` | open: any number of distributions, paid for by use, optionally until a `validUntil` its open sublicenses inherit | 1.0 | yes; the root license is one | observers of the license |
+| `ConsumableLicense` | one distribution, prepaid | 0.0 | no | observers of its `LicenseGrant` |
+| `SubscriptionLicense` | any number of distributions until `validUntil`, prepaid | 0.0 | no | observers of the license |
+| `CreditLicense` | `credits` distributions, prepaid; the contract is replaced on each, keeping the id it was issued with, which the delegate is told | 0.0 | no | observers of its `LicenseGrant` |
 
 The rule is one line: open licenses are metered, typed licenses are prepaid.
 Prepaid distributions are still reported, at weight 0.0.
+
+The consumable and the credit license are consumed on every distribution,
+the first spent, the second replaced with one credit fewer until the last
+is spent, and an observer
+of a consumed contract is informed of the exercise: an operator observing
+such a license would learn of every distribution under it. Nobody observes
+them. What the operator and the licensor see is a `LicenseGrant`, created
+with the license by the same choice and signed by the license's owner,
+carrying the license as issued: its definition, owner, licensor, operator
+and terms. Every distribution under the license fetches the grant, which
+informs nobody beyond the owner, and none consumes it; the licensor or the
+operator revokes the grant through `LicenseGrant_Revoke`, after which the
+license cannot distribute. The grant does not say whether the license was
+spent.
 
 The kind of a sublicense is the parent's `License_CreateSublicense`
 argument `licenseType`, decoded as `LicenseTerms`:

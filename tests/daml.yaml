@@ -10,13 +10,12 @@ dependencies:
   - daml-stdlib
   - daml-script
 data-dependencies:
-  - ../deps/canton-data-standard-utils-v1-0.2.0.dar
-  - ../deps/canton-data-standard-datapoint-v1-0.2.0.dar
-  - ../deps/canton-data-standard-distributor-key-v1-0.2.0.dar
-  - ../deps/canton-data-standard-codecs-0.2.0.dar
+  - ../deps/canton-data-standard-utils-v1-0.3.0.dar
+  - ../deps/canton-data-standard-datapoint-v1-0.3.0.dar
+  - ../deps/canton-data-standard-distributor-key-v1-0.3.0.dar
+  - ../deps/canton-data-standard-codecs-0.3.0.dar
   - ../interfaces/caps-api-core-v1/.daml/dist/caps-api-core-v1-0.1.0.dar
-  - ../deps/redstone-common-v20-0.5.0.dar
-  - ../deps/redstone-sdk-v20-0.5.0.dar
+  - ../deps/redstone-sdk-v1-0.5.0.dar
   - ../caps-core/.daml/dist/caps-core-0.1.0.dar
   - ../extensions/caps-extended-licensing/.daml/dist/caps-extended-licensing-0.1.0.dar
   - ../extensions/caps-accounting/.daml/dist/caps-accounting-0.1.0.dar

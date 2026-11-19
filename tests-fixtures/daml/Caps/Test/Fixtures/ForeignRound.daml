@@ -1,0 +1,21 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | A round template of another package, signed by whoever creates it: its
+-- view says whatever its creator writes. A tool that takes a round's view
+-- for the round of the chain is fooled by one.
+module Caps.Test.Fixtures.ForeignRound where
+
+import qualified Caps.Api.CoreV1 as Api
+
+template ForeignRound
+  with
+    owner : Party
+      -- ^ The signatory, whatever the view claims.
+    shown : Api.RoundView
+  where
+    signatory owner
+
+    interface instance Api.Round for ForeignRound where
+      view = shown
+      round_archiveImpl _ _ = pure ()

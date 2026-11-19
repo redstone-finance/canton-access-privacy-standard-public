@@ -7,7 +7,8 @@
 -- vendor-specific payload.
 --
 -- The capsule's `dataPoint` is the signed content: its `publishedAt`,
--- `schemaVersion` and `values` are the envelope's. The payload adds what the
+-- `schemaVersion` and `values` are the envelope's; its metadata, which the
+-- envelope does not carry, is not verified. The payload adds what the
 -- data point does not carry: the envelope's `expiresAt` and one signature per
 -- node, as a map `{ expiresAt : AVTime, signatures : AVList [AVText] }`. Each
 -- signature is hex DER ECDSA over the SHA-256 of the envelope's structural

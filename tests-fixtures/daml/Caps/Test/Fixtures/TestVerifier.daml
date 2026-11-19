@@ -27,9 +27,10 @@ template TestVerifier
       -- ^ Secrets a round attestation may be computed with; empty for none.
       -- A key attests the rounds of one definition only.
     observers : [Party]
-      -- ^ For the canonical instance, the readers: a publication exercises
-      -- the verifier, and a contract used in a transaction must be visible
-      -- to the submitter. A consumer's own instance needs none.
+      -- ^ For the canonical instance, the publishers and the readers: a
+      -- publication exercises the verifier, and a contract used in a
+      -- transaction must be visible to the submitter; a reader copies its
+      -- parameters. A consumer's own instance needs none.
     maxBehind : RelTime
       -- ^ How far behind the reference time a fixing time may be.
     maxAhead : RelTime

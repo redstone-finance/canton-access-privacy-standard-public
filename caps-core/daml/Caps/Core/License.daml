@@ -13,7 +13,9 @@
 -- licensor it names, as the parent's signatory, not to an observer.
 module Caps.Core.License where
 
+import DA.Action ((<=<))
 import DA.Optional (whenSome)
+import DA.Time (isLedgerTimeLE)
 
 import qualified Caps.Api.CoreV1 as Api
 import Caps.Core.Distribution (distribute, sublicenseDelegate)
@@ -79,6 +81,5 @@ template License
            revoker == licensor || revoker == operator
 
 assertNotExpired : Optional Time -> Update ()
-assertNotExpired validUntil = do
-  now <- getTime
-  whenSome validUntil $ \t -> assertMsg "license expired" $ now <= t
+assertNotExpired validUntil =
+  whenSome validUntil $ assertMsg "license expired" <=< isLedgerTimeLE

@@ -15,7 +15,8 @@ is what the oracle's nodes signed) and **canonicality**
 Where the feed attests its rounds, a party that cannot read the round gets the
 second from the view alone, through the round's attestation (the key holder
 designated the content for the round number), proven against everyone but the
-key holder. Everything else is one of two weaker things:
+key holder; what a party that will not rest on a single key can do is under
+the verifiers, below. Everything else is one of two weaker things:
 
 - **Policed**: made visible to a party that can react. License provenance is
   policed: the operator observes every license that names it, the licensor
@@ -45,9 +46,25 @@ the capsule's audience, so the standard forgoes it. Accounting, where in
 use, measures cooperating distributors; the price list and the audit deter
 the others.
 
-**Nothing on the consumption path touches a contract of the operator**, but
-the operator does learn who publishes rounds and, in the reference
-implementation, who holds licenses.
+**Nothing on the consumption path touches a contract of the operator**,
+with one exception a consumer chooses: a transaction that exercises
+`Round_Fetch` is confirmed by the round's signatories, who learn who used
+which round. The operator also learns who publishes rounds and, in the
+reference implementation, who holds licenses.
+
+**Stakeholders see each other.** Every stakeholder of a contract sees its
+full signatory and observer lists: the readers on the definition, the
+canonical verifier and every round, the root license's licensees on every
+root capsule, the clients of one distributed capsule. A party hosted on a
+consumer's participant is named to the whole synchronizer by the topology.
+So a consumer list cannot be put on the ledger in confidence, by
+observation or by hosting; the reference deployment keeps it off with a
+readers party on read nodes ([lifecycle.md](lifecycle.md)). What that
+moves is trust, to the read nodes a consumer queries. A round a read node
+makes up fails the attestation, and where the feed does not attest only a
+second read node tells; a withheld or stale round a second one reveals;
+and a read node sees who reads, unless the rounds are served without
+authentication.
 
 **On-ledger metering cannot be made bypass-proof without revealing clients.**
 Every variant that would catch the direct creation of a capsule requires a
@@ -84,9 +101,10 @@ consumer assumes.
   sees.
 - **A round binds a payload to one fixing time, so a payload cannot be
   replayed as a later round.** The head refuses a fixing time not strictly
-  after the previous round's, and the RedStone verifier requires the
-  signed packages to carry exactly the fixing time, so a payload signed
-  once can be the content of at most one round. A capsule can be
+  after the previous round's, the shipped verifiers one that is not a whole
+  millisecond, and the RedStone verifier requires the signed packages to
+  carry exactly the fixing time, so a payload signed once can be the
+  content of at most one round. A capsule can be
   redistributed any number of times; every copy verifies against the same
   round, which is the design.
 - **Freshness is a window, not a timestamp check.** `maxBehind` and
@@ -94,14 +112,23 @@ consumer assumes.
   anywhere inside passes. A consumer that needs a tighter bound applies
   its own to `publishedAt`, and a consumer that needs the fixing time
   itself reads it from the data point, which the signatures cover.
+- **Freshness does not choose the round.** Every round of the window is
+  fresh, and a party that settles alone picks among them unless its
+  contract names the fixing ([specification.md](specification.md),
+  section 5).
 - **The commitment is only as strong as its function.** The round's
   `dataHash` ties content to a round through whatever the verifier
   computes: keccak256 of the signed payload for RedStone, the Data
-  Standard's structural hash for its envelope. A verifier whose commitment
-  ignored part of the content would let that part vary between capsules
-  of one round; the specification requires the commitment to cover
-  everything `License_Distribute` copies, and the shipped verifiers hash
-  the signed bytes or the signed envelope in full.
+  Standard's structural hash for its envelope. What the commitment leaves
+  out, the authenticity check binds: the RedStone data point to the
+  packages its payload carries, and its schema version to a parameter.
+  Neither binds `metadata`, which no oracle signs: it is the capsule
+  signatory's annotation, and a consumer that acts on it trusts the
+  distributor. A consumer that checks
+  the round alone, as an off-ledger reader may, relies on the payload
+  bytes or the envelope, and on nothing a verifier it did not run would
+  have derived. [off-ledger.md](off-ledger.md) states what a party without
+  a participant can check and whom it trusts for the rest.
 - **Verification costs the consumer, nobody else.** Every check runs on
   the consumer's participant; a large payload or an expensive signature
   scheme is the consumer's compute, and in a settlement it is re-executed
@@ -125,7 +152,16 @@ consumer assumes.
   to the round it did, and can show it to anyone; a reader tells cheating from
   an outage by the fixing times, since two candidates fresh together are
   equivocation and two that never were are a gap in publication. Policed, not
-  excluded.
+  excluded. A party that will not rest on one key has three ways, the
+  private ones first. Where it consents after it is shown the view, as in a
+  propose and accept, it reads the round and compares before it accepts. A
+  verifier may require the signatures of several keys, the auditors' among
+  them, so that equivocation takes them all, at the cost of every key
+  holder signing every round; the shipped verifiers take one. As the last
+  resort, where the other party settles alone and equivocation must be
+  excluded, the settlement exercises `Round_Fetch` instead of taking a
+  view: the round's signatories then confirm the transaction and learn of
+  it, the one exception to a consumption the operator does not see.
 - **A candidate can be attested and never published.** When publication fails
   for longer than the freshness window, the key holder signs a new candidate
   for the same number and that one becomes the round. A party without the round

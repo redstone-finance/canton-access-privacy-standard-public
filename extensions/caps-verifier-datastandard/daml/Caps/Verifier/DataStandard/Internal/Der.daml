@@ -1,0 +1,52 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | What the `DA.Crypto.Text` builtins take of a signature and a key. They
+-- abort on anything else, so `DataStandardVerifier` checks both here before
+-- it calls one or the library that does.
+module Caps.Verifier.DataStandard.Internal.Der
+  ( isDerSignature
+  , isDerEncoded
+  ) where
+
+import DA.Crypto.Text (fromHex, isHex)
+import qualified DA.Text as T
+
+-- | Whether `hex` is a signature the `DA.Crypto.Text` builtins take, which
+-- abort on anything else: inside the DER envelope exactly two integers, each
+-- minimal, not negative and below the order of secp256k1.
+isDerSignature : Text -> Bool
+isDerSignature hex = isDerEncoded hex && (afterScalar body >>= afterScalar) == Some ""
+  where
+    body = T.drop 4 $ T.asciiToLower hex
+
+-- | Whether `hex` has the DER envelope of a signature and a key: hex bytes,
+-- the SEQUENCE tag and a one-byte length covering the rest.
+isDerEncoded : Text -> Bool
+isDerEncoded hex =
+  isHex hex && T.length hex >= 4 && T.take 2 hex == "30"
+    && fmap (\n -> 2 * (2 + n)) (fromHex (T.substring 2 2 hex)) == Some (T.length hex)
+
+-- | What follows the DER integer at the head of `hex`, lower case; None when
+-- `hex` starts with no integer the builtins take as a signature scalar.
+afterScalar : Text -> Optional Text
+afterScalar hex = do
+  n <- if T.length hex >= 4 && T.take 2 hex == "02" then fromHex $ T.substring 2 2 hex else None
+  let digits = T.take (2 * n) (T.drop 4 hex)
+  if T.length digits == 2 * n && isScalar digits then Some $ T.drop (4 + 2 * n) hex else None
+
+-- | Whether `digits`, lower case hex, is a DER integer the builtins take as a
+-- signature scalar: not negative, without a redundant leading zero byte, and
+-- below the order of secp256k1.
+isScalar : Text -> Bool
+isScalar digits = topBitClear digits && not redundantZero && belowOrder
+  where
+    topBitClear text = T.take 1 text `elem` ["0", "1", "2", "3", "4", "5", "6", "7"]
+    leadingZero = T.take 2 digits == "00"
+    redundantZero = leadingZero && topBitClear (T.drop 2 digits)
+    magnitude = if leadingZero then T.drop 2 digits else digits
+    belowOrder = T.length magnitude < 64 || (T.length magnitude == 64 && magnitude < curveOrder)
+
+-- | The order of the secp256k1 group, big-endian hex.
+curveOrder : Text
+curveOrder = "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141"

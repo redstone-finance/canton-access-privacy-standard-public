@@ -1,0 +1,22 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | A license template of another package, signed by whoever creates it:
+-- its view names whatever owner and licensees its creator writes. A tool
+-- that takes a license's view for who issued it is fooled by one.
+module Caps.Test.Fixtures.ForeignLicense where
+
+import qualified Caps.Api.CoreV1 as Api
+
+template ForeignLicense
+  with
+    owner : Party
+      -- ^ The signatory, whatever `shown.owner` says.
+    shown : Api.LicenseView
+  where
+    signatory owner
+
+    interface instance Api.License for ForeignLicense where
+      view = shown
+      license_distributeImpl _ _ = abort "not a license"
+      license_createSublicenseImpl _ _ = abort "not a license"

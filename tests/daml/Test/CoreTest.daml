@@ -6,10 +6,12 @@
 -- revocation, and the visibility claims the standard makes.
 module Test.CoreTest where
 
+import DA.Action (foldlA)
 import DA.Assert ((===))
-import DA.List (sort)
+import DA.Foldable (foldMap)
+import DA.List (sort, unzip3, (!!))
 import qualified DA.TextMap as TM
-import DA.Time (addRelTime, days, hours, minutes)
+import DA.Time (addRelTime, days, hours, minutes, seconds)
 import Daml.Script
 
 import qualified Caps.Api.CoreV1 as Api
@@ -18,6 +20,8 @@ import Caps.Core.DataDefinition
 import Caps.Core.License (License(..), License_Revoke(..))
 import Caps.Core.Round (Round(..))
 import Caps.Core.RoundHead (RoundHead(..), RoundHead_Pause(..), RoundHead_Resume(..))
+import Caps.Test.Fixtures.ForeignLicense
+import Caps.Test.Fixtures.ForeignRound
 import Caps.Test.Fixtures.Settlement
 import Caps.Test.Fixtures.TestVerifier
 import DataStandard.DataPointV1
@@ -52,7 +56,8 @@ attestationKey = "producer-key"
 -- finalization, root license naming `licensee` and `publisher`. A choice can
 -- only be exercised on contracts its submitter can see, so a publisher must
 -- see the head, the verifier and the root license: the publisher here is a
--- reader and a licensee, the stranger uses disclosure.
+-- reader, a licensee and an observer of the head, the stranger uses
+-- disclosure. The reader observes the rounds alone.
 setup : Script Feed
 setup = do
   operator <- allocateParty "Operator"
@@ -75,6 +80,7 @@ setup = do
     operator
     auditors = [auditor1, auditor2]
     readers = [reader, publisher]
+    headObservers = [licensee, publisher]
     verifier
     publishers = None
     accepted = []
@@ -93,6 +99,10 @@ setup = do
   -- strictly later; on the static-time test ledger that means moving on.
   passTime (minutes 1)
   pure Feed with ..
+
+-- | The parties that sign the feed's definition, head and rounds.
+chainSignatories : Feed -> [Party]
+chainSignatories feed = [feed.operator, feed.auditor1, feed.auditor2]
 
 -- | A data point as the publisher would build it: the fixing time is `at`,
 -- the distributor the operator.
@@ -155,7 +165,7 @@ bootstrapDefinition feed dataId publishers = do
   verifier <- verifierFor feed dataId
   proposal <- submit feed.operator $ createCmd DefinitionProposal with
     dataId, operator = feed.operator, auditors = [], readers = [feed.reader, feed.publisher]
-    verifier, publishers, accepted = []
+    headObservers = [feed.licensee, feed.publisher], verifier, publishers, accepted = []
   (definitionCid, headCid) <- submit feed.operator $ exerciseCmd proposal DefinitionProposal_Finalize
   pure (toInterfaceContractId definitionCid, toInterfaceContractId headCid)
 
@@ -178,9 +188,12 @@ testBootstrapCreatesGenesis = do
   [(_, genesis)] <- query @Round feed.reader
   genesis.roundNumber === 0
   genesis.definition === feed.definition
-  Some headView <- queryInterfaceContractId feed.reader feed.head
+  Some headView <- queryInterfaceContractId feed.licensee feed.head
   headView.isPaused === False
   headView.definition === feed.definition
+  -- A reader observes the rounds, not the head.
+  None <- queryInterfaceContractId feed.reader feed.head
+  pure ()
 
 testGenesisCarriesNoDataHash : Script ()
 testGenesisCarriesNoDataHash = do
@@ -201,8 +214,8 @@ testPublishRound = do
   result <- publish feed feed.publisher feed.head now 50000.0
 
   -- The old head is consumed, the new one points at round 1.
-  None <- queryInterfaceContractId feed.reader feed.head
-  Some headView <- queryInterfaceContractId feed.reader result.head
+  None <- queryInterfaceContractId feed.licensee feed.head
+  Some headView <- queryInterfaceContractId feed.licensee result.head
   headView.round === result.round
   headView.roundNumber === 1
   Some roundView <- queryInterfaceContractId feed.reader result.round
@@ -212,12 +225,15 @@ testPublishRound = do
 
   -- The root capsule is visible to the operator, the auditors and the
   -- licensees of the root license (the publisher is one), and to nobody
-  -- else: not to readers.
+  -- else: not to readers. A reader does not observe the head either: an
+  -- observer of the consumed head would witness the whole publication, the
+  -- root capsule included, which an active-contract query cannot show.
   Some _ <- queryInterfaceContractId feed.operator result.capsule
   Some _ <- queryInterfaceContractId feed.auditor1 result.capsule
   Some _ <- queryInterfaceContractId feed.licensee result.capsule
   Some _ <- queryInterfaceContractId feed.publisher result.capsule
   None <- queryInterfaceContractId feed.reader result.capsule
+  None <- queryInterfaceContractId feed.reader result.head
 
   -- Two consecutive rounds advance the chain.
   passTime (minutes 1)
@@ -238,7 +254,7 @@ testPublicationIsOpen = do
   -- ...but with the head, the verifier and the root license disclosed to
   -- it, and no round, it can publish authentic data: the authority to sign
   -- the round comes from the head, not from the caller.
-  Some headDisc <- queryDisclosure feed.reader (fromInterfaceContractId @RoundHead feed.head)
+  Some headDisc <- queryDisclosure feed.operator (fromInterfaceContractId @RoundHead feed.head)
   Some verifierDisc <- queryDisclosure feed.reader (fromInterfaceContractId @TestVerifier feed.verifier)
   Some licenseDisc <- queryDisclosure feed.operator (fromInterfaceContractId @License feed.rootLicense)
   attestation <- attestationFor feed feed.head now 50000.0
@@ -371,6 +387,25 @@ testRejectsForeignLicense = do
       attestation = None
       content = (contentAt feed now 50000.0) with license = toInterfaceContractId foreignCid
 
+-- A license of another template may name the operator as its owner, and
+-- any licensees, in its view. The head goes by who signed it, or a
+-- publisher would choose who receives the operator's root capsule.
+testRejectsALicenseTheOperatorDidNotSign : Script ()
+testRejectsALicenseTheOperatorDidNotSign = do
+  feed <- setup
+  now <- getTime
+  forged <- submit feed.publisher $ createCmd ForeignLicense with
+    owner = feed.publisher
+    shown = Api.LicenseView with
+      definition = feed.definition, owner = feed.operator
+      licensees = [feed.licensee, feed.publisher, feed.stranger], delegate = None
+  attestation <- attestationFor feed feed.head now 50000.0
+  submitMustFailWith (actAs feed.publisher) "root license is not signed by the operator" $
+    exerciseCmd feed.head Api.RoundHead_CreateRound with
+      actor = feed.publisher
+      attestation
+      content = (contentAt feed now 50000.0) with license = toInterfaceContractId forged
+
 testRejectsLicenseOfAnotherDefinition : Script ()
 testRejectsLicenseOfAnotherDefinition = do
   feed <- setup
@@ -407,6 +442,27 @@ testRejectsPublisherNotAdmitted = do
       attestation = None
       content = (contentAt feed now 50000.0) with license
 
+-- | An observer of the head witnesses every publication in full, so the head
+-- refuses to publish while one of its observers is outside the root
+-- capsule's audience: here the reader, who holds no license.
+testRejectsHeadObserverOutsideTheAudience : Script ()
+testRejectsHeadObserverOutsideTheAudience = do
+  feed <- setup
+  verifier <- verifierFor feed "ETH/USD"
+  proposal <- submit feed.operator $ createCmd DefinitionProposal with
+    dataId = "ETH/USD", operator = feed.operator, auditors = [], readers = [feed.reader]
+    headObservers = [feed.reader], verifier, publishers = None, accepted = []
+  (definitionCid, headCid) <- submit feed.operator $ exerciseCmd proposal DefinitionProposal_Finalize
+  let definition = toInterfaceContractId @Api.DataDefinition definitionCid
+  license <- createRootLicense feed.operator [feed.licensee] definition
+  passTime (minutes 1)
+  now <- getTime
+  submitMustFailWith (actAs feed.operator) "head observer outside the root capsule's audience" $
+    exerciseCmd (toInterfaceContractId @Api.RoundHead headCid) Api.RoundHead_CreateRound with
+      actor = feed.operator
+      attestation = None
+      content = (contentAt feed now 50000.0) with license
+
 testRaceOnHead : Script ()
 testRaceOnHead = do
   feed <- setup
@@ -426,9 +482,9 @@ testPauseAndResume = do
   submitMustFailWith (actAs feed.publisher) "publication is paused" $
     exerciseCmd paused Api.RoundHead_CreateRound with
       actor = feed.publisher, content = contentAt feed now 50000.0, attestation = None
-  -- A reader sees the head but is no auditor, so it cannot resume.
-  submitMustFailWith (actAs feed.reader) "not an auditor" $
-    exerciseCmd pausedCid RoundHead_Resume with auditor = feed.reader
+  -- A licensee sees the head but is no auditor, so it cannot resume.
+  submitMustFailWith (actAs feed.licensee) "not an auditor" $
+    exerciseCmd pausedCid RoundHead_Resume with auditor = feed.licensee
   resumedCid <- submit feed.auditor2 $ exerciseCmd pausedCid RoundHead_Resume with auditor = feed.auditor2
   _ <- publish feed feed.publisher (toInterfaceContractId resumedCid) now 50000.0
   pure ()
@@ -441,7 +497,7 @@ testProposalCanBeCancelled = do
   verifier <- verifierFor feed "ETH/USD"
   let newProposal = submit feed.operator $ createCmd DefinitionProposal with
         dataId = "ETH/USD", operator = feed.operator, auditors = [feed.auditor1, feed.auditor2]
-        readers = [feed.reader], verifier, publishers = None, accepted = []
+        readers = [feed.reader], headObservers = [], verifier, publishers = None, accepted = []
   proposal0 <- newProposal
   proposal1 <- submit feed.auditor1 $ exerciseCmd proposal0 DefinitionProposal_Accept with auditor = feed.auditor1
   -- Once an auditor has accepted, the operator cannot archive the proposal
@@ -514,7 +570,7 @@ testPublicationSurvivesArchivingTheLatestRound = do
   passTime (minutes 1)
   later <- getTime
   result2 <- publish feed feed.publisher result1.head later 50100.0
-  Some headView <- queryInterfaceContractId feed.reader result2.head
+  Some headView <- queryInterfaceContractId feed.licensee result2.head
   headView.roundNumber === 2
   Some roundView <- queryInterfaceContractId feed.reader result2.round
   roundView.roundNumber === 2
@@ -559,7 +615,9 @@ testSettlementOnSuppliedView = do
     owner = feed.client2, acceptedTag = nodesTag, attestationKeys = [attestationKey]
     observers = [feed.client1], maxBehind = hours 1, maxAhead = minutes 5
   settlement <- submit (actAs feed.client1 <> actAs feed.client2) $ createCmd Settlement with
-    a = feed.client1, b = feed.client2, verifier = toInterfaceContractId verifierCid
+    a = feed.client1, b = feed.client2, definition = feed.definition
+    verifier = toInterfaceContractId verifierCid
+    roundSignatories = chainSignatories feed, fixing = AnyFreshRound
   -- Another authentic payload for the round, with a view that agrees with it.
   let other = capsuleView with content = contentAt feed roundView.timestamp 51000.0
       otherView = roundView with
@@ -574,6 +632,294 @@ testSettlementOnSuppliedView = do
   Some record <- queryContractId feed.client2 settled
   record.roundNumber === roundView.roundNumber
   record.dataPoint === capsuleView.content.dataPoint
+
+-- A reader takes a round's view inside a transaction as its observer.
+testRoundIsFetchedByAReader : Script ()
+testRoundIsFetchedByAReader = do
+  feed <- setup
+  now <- getTime
+  result <- publish feed feed.publisher feed.head now 50000.0
+  fetched <- submit feed.reader $ exerciseCmd result.round Api.Round_Fetch with
+    actor = feed.reader, signatories = chainSignatories feed
+  Some roundView <- queryInterfaceContractId feed.reader result.round
+  fetched === roundView
+
+-- A party that is no reader takes a round's view inside a transaction once
+-- the round is disclosed to it, and not before.
+testRoundIsFetchedByDisclosure : Script ()
+testRoundIsFetchedByDisclosure = do
+  feed <- setup
+  now <- getTime
+  result <- publish feed feed.publisher feed.head now 50000.0
+  let fetchAs signatories = exerciseCmd result.round Api.Round_Fetch with
+        actor = feed.client1, signatories
+  submitMustFail feed.client1 $ fetchAs $ chainSignatories feed
+  Some roundDisc <- queryDisclosure feed.reader (fromInterfaceContractId @Round result.round)
+  fetched <- submit (actAs feed.client1 <> disclose roundDisc) $ fetchAs $ chainSignatories feed
+  Some roundView <- queryInterfaceContractId feed.reader result.round
+  fetched === roundView
+  -- The round is the chain's only for a caller that names who signs the
+  -- chain: one auditor short, or the operator alone, is refused.
+  submitMustFailWith (actAs feed.client1 <> disclose roundDisc)
+    "round is not signed by the named signatories" $ fetchAs [feed.operator, feed.auditor1]
+  submitMustFailWith (actAs feed.client1 <> disclose roundDisc)
+    "round is not signed by the named signatories" $ fetchAs [feed.operator]
+
+-- Alice, who is no reader, settles on the round the ledger holds: a view of
+-- her own making has no way in, and an authentic capsule that is not the
+-- round's fails against the round itself.
+testSettlementOnTheLedgersRound : Script ()
+testSettlementOnTheLedgersRound = do
+  (feed, rootView, sublicense, result) <- distributionFixture
+  capsule <- submit feed.licensee $ exerciseCmd sublicense Api.License_Distribute with
+    source = Api.ByView rootView, clients = [feed.client1]
+  Some capsuleView <- queryInterfaceContractId feed.client1 capsule
+  Some roundView <- queryInterfaceContractId feed.reader result.round
+  Some roundDisc <- queryDisclosure feed.reader (fromInterfaceContractId @Round result.round)
+  verifierCid <- submit feed.client2 $ createCmd TestVerifier with
+    owner = feed.client2, acceptedTag = nodesTag, attestationKeys = [attestationKey]
+    observers = [feed.client1], maxBehind = hours 1, maxAhead = minutes 5
+  settlement <- submit (actAs feed.client1 <> actAs feed.client2) $ createCmd Settlement with
+    a = feed.client1, b = feed.client2, definition = feed.definition
+    verifier = toInterfaceContractId verifierCid
+    roundSignatories = chainSignatories feed, fixing = AnyFreshRound
+  let other = capsuleView with content = contentAt feed roundView.timestamp 51000.0
+  submitMustFailWith (actAs feed.client1 <> disclose roundDisc) "not canonical: [\"commitment mismatch\"]" $
+    exerciseCmd settlement Settlement_SettleOnRound with capsule = other, round = result.round
+  settled <- submit (actAs feed.client1 <> disclose roundDisc) $
+    exerciseCmd settlement Settlement_SettleOnRound with
+      capsule = capsuleView, round = result.round
+  Some record <- queryContractId feed.client2 settled
+  record.roundNumber === roundView.roundNumber
+
+-- Fixing rules ----------------------------------------------------------------
+
+-- | Three rounds a minute apart, all fresh together, each distributed to
+-- Alice (client1), who is no reader; and a settlement of Alice and Bob
+-- (client2) on `fixing`, which Alice settles alone.
+data Fixings = Fixings with
+    feed : Feed
+    settlement : ContractId Settlement
+    genesis : ContractId Api.Round
+    rounds : [Api.CreateRoundResult]
+    capsules : [Api.CapsuleView]
+      -- ^ Alice's capsules of the three rounds.
+    times : [Time]
+      -- ^ The fixing times of the three rounds.
+
+fixings : (Time -> FixingRule) -> Script Fixings
+fixings rule = do
+  feed <- setup
+  Some genesisHead <- queryInterfaceContractId feed.operator feed.head
+  sublicense <- submit feed.licensee $ exerciseCmd feed.rootLicense Api.License_CreateSublicense with
+    actor = feed.licensee, licenseType = AVText "redistribution", licensees = [feed.client1]
+  let fix (head, done) price = do
+        passTime (minutes 1)
+        at <- getTime
+        result <- publish feed feed.publisher head at price
+        Some rootView <- queryInterfaceContractId feed.licensee result.capsule
+        capsule <- submit feed.licensee $ exerciseCmd sublicense Api.License_Distribute with
+          source = Api.ByView rootView, clients = [feed.client1]
+        Some capsuleView <- queryInterfaceContractId feed.client1 capsule
+        pure (result.head, done <> [(result, capsuleView, at)])
+  (_, fixed) <- foldlA fix (feed.head, []) [50000.0, 50100.0, 50200.0]
+  let (rounds, capsules, times) = unzip3 fixed
+      first :: _ = times
+  verifierCid <- submit feed.client2 $ createCmd TestVerifier with
+    owner = feed.client2, acceptedTag = nodesTag, attestationKeys = [attestationKey]
+    observers = [feed.client1], maxBehind = hours 1, maxAhead = minutes 5
+  settlement <- submit (actAs feed.client1 <> actAs feed.client2) $ createCmd Settlement with
+    a = feed.client1, b = feed.client2, definition = feed.definition
+    verifier = toInterfaceContractId verifierCid
+    roundSignatories = chainSignatories feed, fixing = rule first
+  pure Fixings with feed, settlement, genesis = genesisHead.round, rounds, capsules, times
+
+-- | The view of `round` as the readers party reads it.
+roundViewOf : Feed -> Api.CreateRoundResult -> Script Api.RoundView
+roundViewOf feed result = do
+  Some view <- queryInterfaceContractId feed.reader result.round
+  pure view
+
+-- Without a rule Alice settles on whichever fresh round suits her; with the
+-- round number agreed, only on that round.
+testSettlementHoldsTheAgreedRound : Script ()
+testSettlementHoldsTheAgreedRound = do
+  unpinned <- fixings $ const AnyFreshRound
+  let [_, _, latestCapsule] = unpinned.capsules
+      [_, _, latest] = unpinned.rounds
+  latestView <- roundViewOf unpinned.feed latest
+  _ <- submit unpinned.feed.client1 $ exerciseCmd unpinned.settlement Settlement_Settle with
+    capsule = latestCapsule, round = latestView
+
+  pinned <- fixings $ const $ RoundNumber 2
+  let [_, capsule2, capsule3] = pinned.capsules
+      [_, round2, round3] = pinned.rounds
+  view2 <- roundViewOf pinned.feed round2
+  view3 <- roundViewOf pinned.feed round3
+  submitMustFailWith (actAs pinned.feed.client1) "not the agreed round" $
+    exerciseCmd pinned.settlement Settlement_Settle with capsule = capsule3, round = view3
+  settled <- submit pinned.feed.client1 $ exerciseCmd pinned.settlement Settlement_Settle with
+    capsule = capsule2, round = view2
+  Some record <- queryContractId pinned.feed.client2 settled
+  record.roundNumber === 2
+
+-- The freshness window is the parties' to set: under a verifier of ninety
+-- seconds the round of two minutes ago no longer settles, which under the
+-- hour of the other tests it does.
+testSettlementUnderANarrowerWindow : Script ()
+testSettlementUnderANarrowerWindow = do
+  f <- fixings $ const AnyFreshRound
+  let alice = f.feed.client1
+      bob = f.feed.client2
+      [capsule1, capsule2, _] = f.capsules
+  [view1, view2, _] <- mapA (roundViewOf f.feed) f.rounds
+  verifierCid <- submit bob $ createCmd TestVerifier with
+    owner = bob, acceptedTag = nodesTag, attestationKeys = [attestationKey]
+    observers = [alice], maxBehind = seconds 90, maxAhead = minutes 5
+  narrow <- submit (actAs alice <> actAs bob) $ createCmd Settlement with
+    a = alice, b = bob, definition = f.feed.definition
+    verifier = toInterfaceContractId verifierCid
+    roundSignatories = chainSignatories f.feed, fixing = AnyFreshRound
+  submitMustFailWith (actAs alice) "not fresh: [\"fixing time too far in the past\"]" $
+    exerciseCmd narrow Settlement_Settle with capsule = capsule1, round = view1
+  _ <- submit alice $ exerciseCmd narrow Settlement_Settle with capsule = capsule2, round = view2
+  _ <- submit alice $ exerciseCmd f.settlement Settlement_Settle with capsule = capsule1, round = view1
+  pure ()
+
+-- The settlement is on the data set both parties pinned: a capsule of
+-- another definition is refused whatever else it passes.
+testSettlementRefusesAnotherDefinitionsCapsule : Script ()
+testSettlementRefusesAnotherDefinitionsCapsule = do
+  f <- fixings $ const AnyFreshRound
+  let capsule1 :: _ = f.capsules
+      round1 :: _ = f.rounds
+  view1 <- roundViewOf f.feed round1
+  (otherDefinition, _) <- bootstrapDefinition f.feed "ETH/USD" None
+  submitMustFailWith (actAs f.feed.client1) "capsule of another definition" $
+    exerciseCmd f.settlement Settlement_Settle with
+      capsule = capsule1 with definition = otherDefinition
+      round = view1 with definition = otherDefinition
+
+-- With the fixing time agreed, only the round fixed at that time settles.
+testSettlementHoldsTheAgreedFixingTime : Script ()
+testSettlementHoldsTheAgreedFixingTime = do
+  f <- fixings $ FixingTime . (`addRelTime` minutes 1)
+  let [capsule1, capsule2, _] = f.capsules
+      [round1, round2, _] = f.rounds
+  view1 <- roundViewOf f.feed round1
+  view2 <- roundViewOf f.feed round2
+  submitMustFailWith (actAs f.feed.client1) "not the agreed fixing time" $
+    exerciseCmd f.settlement Settlement_Settle with capsule = capsule1, round = view1
+  settled <- submit f.feed.client1 $ exerciseCmd f.settlement Settlement_Settle with
+    capsule = capsule2, round = view2
+  Some record <- queryContractId f.feed.client2 settled
+  record.roundNumber === 2
+
+-- The first round at or after a time between rounds 1 and 2 is round 2, and
+-- the ledger says so: Alice has the settlement fetch the round and the one
+-- before it, both disclosed to her.
+testSettlementOnTheFirstRoundAfterByTheLedger : Script ()
+testSettlementOnTheFirstRoundAfterByTheLedger = do
+  f <- fixings $ FirstRoundAtOrAfter . (`addRelTime` seconds 30)
+  let alice = f.feed.client1
+      [capsule1, capsule2, capsule3] = f.capsules
+      [round1, round2, round3] = map (.round) f.rounds
+  disclosures <- forA (f.genesis :: [round1, round2, round3]) $ \round -> do
+    Some disclosure <- queryDisclosure f.feed.reader $ fromInterfaceContractId @Round round
+    pure disclosure
+  let shown = actAs alice <> foldMap disclose disclosures
+      on capsule round previous = exerciseCmd f.settlement Settlement_SettleOnRounds with
+        capsule, round, previous
+  submitMustFailWith shown "the rule needs the round before" $
+    exerciseCmd f.settlement Settlement_SettleOnRound with capsule = capsule2, round = round2
+  submitMustFailWith shown "the round is fixed before the agreed time" $ on capsule1 round1 f.genesis
+  submitMustFailWith shown "an earlier round is fixed at or after the agreed time" $ on capsule3 round3 round2
+  submitMustFailWith shown "not the round before" $ on capsule3 round3 round1
+  -- A round before of Alice's own making, numbered 2 and fixed before the
+  -- agreed time, would make round 3 the first: it is not the chain's.
+  view3 <- roundViewOf f.feed $ f.rounds !! 2
+  let first :: _ = f.times
+  forged <- submit alice $ createCmd ForeignRound with
+    owner = alice
+    shown = view3 with roundNumber = 2, timestamp = first, attestation = None
+  submitMustFailWith shown "round is not signed by the named signatories" $
+    on capsule3 round3 $ toInterfaceContractId forged
+  -- Nor is a round of the reference template that Alice signs as its
+  -- operator, which takes no other package.
+  own <- submit alice $ createCmd Round with
+    definition = f.feed.definition, roundNumber = 2, timestamp = first, dataHash = ""
+    operator = alice, auditors = [], readers = [], attestation = None
+  submitMustFailWith shown "round is not signed by the named signatories" $
+    on capsule3 round3 $ toInterfaceContractId own
+  -- A round before of another definition, signed as this one's are, is
+  -- still not the round before.
+  otherVerifier <- verifierFor f.feed "ETH/USD"
+  proposal <- submit f.feed.operator $ createCmd DefinitionProposal with
+    dataId = "ETH/USD", operator = f.feed.operator
+    auditors = [f.feed.auditor1, f.feed.auditor2], readers = [f.feed.reader]
+    headObservers = [], verifier = otherVerifier, publishers = None, accepted = []
+  accepted1 <- submit f.feed.auditor1 $ exerciseCmd proposal DefinitionProposal_Accept with
+    auditor = f.feed.auditor1
+  accepted2 <- submit f.feed.auditor2 $ exerciseCmd accepted1 DefinitionProposal_Accept with
+    auditor = f.feed.auditor2
+  (_, otherHead) <- submit f.feed.operator $ exerciseCmd accepted2 DefinitionProposal_Finalize
+  Some otherHeadView <- queryInterfaceContractId f.feed.operator $ toInterfaceContractId @Api.RoundHead otherHead
+  Some otherGenesis <- queryDisclosure f.feed.reader $ fromInterfaceContractId @Round otherHeadView.round
+  submitMustFailWith (shown <> disclose otherGenesis) "the round before is of another definition" $
+    on capsule1 round1 otherHeadView.round
+  settled <- submit shown $ on capsule2 round2 round1
+  Some record <- queryContractId f.feed.client2 settled
+  record.roundNumber === 2
+
+-- The same rule without the ledger: Alice supplies the capsules and the
+-- attested views of round 2 and of the round before it, and a view of the
+-- round before that nothing attested does not pass.
+testSettlementOnTheFirstRoundAfterBySuppliedViews : Script ()
+testSettlementOnTheFirstRoundAfterBySuppliedViews = do
+  f <- fixings $ FirstRoundAtOrAfter . (`addRelTime` seconds 30)
+  let alice = f.feed.client1
+      [capsule1, capsule2, capsule3] = f.capsules
+  [view1, view2, view3] <- mapA (roundViewOf f.feed) f.rounds
+  let on capsule round previousCapsule previous =
+        exerciseCmd f.settlement Settlement_SettleWithPrevious with
+          capsule, round, previousCapsule, previous
+  submitMustFailWith (actAs alice) "an earlier round is fixed at or after the agreed time" $
+    on capsule3 view3 capsule2 view2
+  submitMustFailWith (actAs alice) "not canonical: [\"round carries no attestation\"]" $
+    on capsule2 view2 capsule1 view1 with attestation = None
+  settled <- submit alice $ on capsule2 view2 capsule1 view1
+  Some record <- queryContractId f.feed.client2 settled
+  record.roundNumber === 2
+
+-- A contract of another template says anything in its view. Alice, with
+-- the attestation key on her side, wraps a candidate the key holder signed
+-- and nobody published in a round of her own. The settlement names the
+-- chain's signatories, so fetching that round is refused; as a supplied
+-- view the same candidate passes, which is the attestation's limit.
+testRoundFetchRefusesAForeignRound : Script ()
+testRoundFetchRefusesAForeignRound = do
+  (feed, rootView, sublicense, result) <- distributionFixture
+  capsule <- submit feed.licensee $ exerciseCmd sublicense Api.License_Distribute with
+    source = Api.ByView rootView, clients = [feed.client1]
+  Some capsuleView <- queryInterfaceContractId feed.client1 capsule
+  Some roundView <- queryInterfaceContractId feed.reader result.round
+  verifierCid <- submit feed.client2 $ createCmd TestVerifier with
+    owner = feed.client2, acceptedTag = nodesTag, attestationKeys = [attestationKey]
+    observers = [feed.client1], maxBehind = hours 1, maxAhead = minutes 5
+  settlement <- submit (actAs feed.client1 <> actAs feed.client2) $ createCmd Settlement with
+    a = feed.client1, b = feed.client2, definition = feed.definition
+    verifier = toInterfaceContractId verifierCid
+    roundSignatories = chainSignatories feed, fixing = AnyFreshRound
+  let other = capsuleView with content = contentAt feed roundView.timestamp 51000.0
+      candidate = roundView with dataHash = testCommitment other.content.dataPoint, attestation = None
+      attested = candidate with attestation = Some $ testAttestation attestationKey candidate
+  forged <- submit feed.client1 $ createCmd ForeignRound with owner = feed.client1, shown = attested
+  submitMustFailWith (actAs feed.client1) "round is not signed by the named signatories" $
+    exerciseCmd settlement Settlement_SettleOnRound with
+      capsule = other, round = toInterfaceContractId forged
+  _ <- submit feed.client1 $ exerciseCmd settlement Settlement_Settle with
+    capsule = other, round = attested
+  pure ()
 
 testDistributeByView : Script ()
 testDistributeByView = do

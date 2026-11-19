@@ -41,5 +41,11 @@ jobs:
       - name: Add dpm to PATH
         run: echo "$HOME/.dpm/bin" >> "$GITHUB_PATH"
 
+      # damlc writes the test transaction listings, which hold box-drawing
+      # characters, only under a UTF-8 locale, and the libraries it ships
+      # with find the runner's locales only through LOCPATH.
       - name: Check headers, build, validate and verify committed DARs
+        env:
+          LC_ALL: C.UTF-8
+          LOCPATH: /usr/lib/locale
         run: make ci

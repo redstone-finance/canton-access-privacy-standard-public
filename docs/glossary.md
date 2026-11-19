@@ -37,8 +37,8 @@ pass the freshness check.
 
 **Canonicality.** The property that a capsule's content is what was fixed
 in the round of its number: the round's commitment matches the content.
-Checked by `Verifier_VerifyRound` against the round read from the
-consumer's own participant or, for a consumer that cannot read it, against
+Checked by `Verifier_VerifyRound` against the round read from a
+participant hosting the reader or, for a consumer that cannot read it, against
 the view the presenter hands over next to the capsule, which the round's
 attestation makes checkable where the verifier names attestation keys.
 
@@ -60,7 +60,8 @@ distribution.
 
 **Confirming party.** A party whose participant must confirm a
 transaction for it to commit: the signatories of every contract the
-transaction creates, consumes, fetches or exercises. Confirmation is
+transaction creates, consumes, fetches or exercises, and the parties that
+act on them. Confirmation is
 validation, not consent. The reason every co-signature costs liveness.
 
 **Consumer.** A client that verifies a capsule before acting on it.
@@ -99,10 +100,14 @@ leave open: an oracle's `Verifier`, a kind of `License`, or a
 timestamp, `dataPoint.publishedAt`, which becomes the round's timestamp.
 Strictly increasing along the chain.
 
+**Fixing rule.** What a contract that settles on a capsule names to say
+which round it means ([specification.md](specification.md), section 5).
+
 **Fork.** Two rounds of the same number for one definition. Excluded by
 the reference governance, where a new head and every round need every
-auditor's signature, available only inside a choice on the head;
-detectable only under weaker variants.
+auditor's signature, available only inside a choice on the head, as long
+as an auditor is independent of the operator; detectable only under weaker
+variants.
 
 **Freshness.** Whether a fixing time is acceptable at a reference time by
 the oracle's window (`maxBehind`, `maxAhead`). Checked by
@@ -157,20 +162,40 @@ the verifier.
 (enforced by the ledger) or out of reach. License provenance and
 accounting are policed.
 
+**Presentation.** A capsule's view and the view of its round, attestation
+included, handed to a consumer that does not read them from the ledger.
+Everything the authenticity, canonicality and freshness checks take as
+input; see [off-ledger.md](off-ledger.md).
+
+**Public party.** A party that holds what every user of a deployment may
+read and acts for nobody, as Daml applications call it. The readers party
+is one.
+
 **Publisher.** The party submitting `RoundHead_CreateRound`; the operator
 or any party the head admits. The authority to sign the round comes from
 the head, not from the publisher.
 
+**Read node.** An observing participant node: one that hosts the readers party
+with observation permission and from which consumers read the rounds; run
+by the operator or a party it designates, never by a consumer.
+
 **Reader.** A party entitled to see that a round exists and to check
-capsules against it: an observer of the rounds, the definition and the
-head.
+capsules against it: an observer of the rounds and the definition. By
+default the readers party.
+
+**Readers party.** The one party a deployment names by default as the
+reader of a definition: a public party in the operator's namespace,
+multi-hosted with observation permission on read nodes, which consumers
+read the rounds as, so that no consumer appears on the ledger as a reader
+([lifecycle.md](lifecycle.md)).
 
 **Root capsule.** The capsule created with a round, distributed by the
 operator under the root license to the root license's licensees.
 
 **Round.** The immutable, price-free record of one fixing: definition,
-number, fixing time, commitment. Visible to the readers. Referenced by
-number, never by contract id.
+number, fixing time, commitment and, where the feed attests, an
+attestation. Visible to the readers. Capsules reference it by number,
+never by contract id.
 
 **Round head.** The head of the round chain and the publishing endpoint:
 one live contract per definition, consumed on every publication, which is
@@ -179,12 +204,14 @@ what makes round numbers unique.
 **Self-report.** What an open distribution marker is: signed by the
 distributor alone, with no field checked by another party at creation.
 
-**Settlement.** Closing a period of distribution markers under the
-accountant's signature, numbered by a settlement head.
+**Settlement.** In accounting, closing a period of distribution markers
+under the accountant's signature, numbered by a settlement head. In the
+guides, also a transaction in which parties settle on a capsule's data.
 
 **Smart-contract upgrade (SCU).** Daml's in-place upgrade of a package.
 Available to implementation packages, never to a package that defines an
-interface, which is why the interface packages hold no logic.
+interface, which is why the interface package holds no logic beyond the
+check of signatories in `Round_Fetch`.
 
 **Stakeholder.** A signatory or observer of a contract. Stakeholders see
 the contract and are informed of its creation and archival.

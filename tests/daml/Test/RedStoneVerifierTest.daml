@@ -20,18 +20,19 @@ import DA.Assert ((===))
 import DA.Foldable (forA_)
 import qualified DA.Text as T
 import qualified DA.TextMap as TM
-import DA.Time (addRelTime, hours, minutes, seconds, milliseconds, time)
+import DA.Time (addRelTime, hours, microseconds, minutes, seconds, milliseconds, time)
 import DA.Date (Month(Jan), date)
 import Daml.Script
 
 import qualified Caps.Api.CoreV1 as Api
 import Caps.Core.DataDefinition
 import Caps.Core.License (License(..))
+import Caps.Test.Fixtures.Signatures (malformedDerSignatures)
 import Caps.Verifier.RedStone
 import Caps.Verifier.RedStone.Internal.Verification (attestationMessage)
 import RedStone.PrimaryProdConfig (redstone_primary_prod_public_keys)
 import DataStandard.DataPointV1 (PublishedDataPointView(..))
-import DataStandard.Utils (AnyValue(..), emptyMetadata)
+import DataStandard.Utils (AnyValue(..), Metadata(..), emptyMetadata)
 
 -- Vectors -------------------------------------------------------------------
 
@@ -41,6 +42,10 @@ testSigners = ["0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817
 
 fixingTime : Time
 fixingTime = addRelTime (time (date 1970 Jan 1) 0 0 0) (milliseconds 1789000000000)
+
+-- | The schema version the verifier requires of every data point.
+testSchemaVersion : Text
+testSchemaVersion = "redstone-1"
 
 -- | The median of the three nodes' values: BTC 50000.12345678, 50010.5,
 -- 49990.0 and ETH 3000.1, 3001.2, 2999.9, signed by keys 1, 2, 3 in turn.
@@ -117,13 +122,13 @@ setup = do
   verifierCid <- submit operator $ createCmd RedStoneVerifier with
     owner = operator, observers = [reader, licensee]
     signers = testSigners, signerCountThreshold = 3, feedIds = ["BTC", "ETH"]
-    attestationKeys = [signersFormat attester]
+    schemaVersion = testSchemaVersion, attestationKeys = [signersFormat attester]
     maxBehind = hours 1, maxAhead = minutes 5
   let verifier = toInterfaceContractId @Api.Verifier verifierCid
 
   proposal <- submit operator $ createCmd DefinitionProposal with
     dataId = "BTC,ETH", operator, auditors = [auditor], readers = [reader, licensee], verifier
-    publishers = None, accepted = []
+    headObservers = [licensee], publishers = None, accepted = []
   accepted <- submit auditor $ exerciseCmd proposal DefinitionProposal_Accept with auditor
   (definitionCid, headCid) <- submit operator $ exerciseCmd accepted DefinitionProposal_Finalize
   let definition = toInterfaceContractId @Api.DataDefinition definitionCid
@@ -138,7 +143,7 @@ setup = do
 
 dataPoint : Party -> Time -> TM.TextMap AnyValue -> PublishedDataPointView
 dataPoint distributor publishedAt values = PublishedDataPointView with
-  distributor, publishedAt, schemaVersion = "redstone-1", values, metadata = emptyMetadata
+  distributor, publishedAt, schemaVersion = testSchemaVersion, values, metadata = emptyMetadata
 
 content : Feed -> Text -> Api.CapsuleContent
 content feed payload = Api.CapsuleContent with
@@ -174,7 +179,7 @@ verifyAsClient feed c = do
   own <- submit feed.client $ createCmd RedStoneVerifier with
     owner = feed.client, observers = []
     signers = testSigners, signerCountThreshold = 3, feedIds = ["BTC", "ETH"]
-    attestationKeys = [signersFormat feed.attester]
+    schemaVersion = testSchemaVersion, attestationKeys = [signersFormat feed.attester]
     maxBehind = hours 1, maxAhead = minutes 5
   let ownVerifier = toInterfaceContractId @Api.Verifier own
   result <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_Verify with
@@ -188,7 +193,7 @@ verifyRoundWith feed attestationKeys round = do
   own <- submit feed.client $ createCmd RedStoneVerifier with
     owner = feed.client, observers = []
     signers = testSigners, signerCountThreshold = 3, feedIds = ["BTC", "ETH"]
-    attestationKeys
+    schemaVersion = testSchemaVersion, attestationKeys
     maxBehind = hours 1, maxAhead = minutes 5
   submit feed.client $ exerciseCmd (toInterfaceContractId @Api.Verifier own) Api.Verifier_VerifyRound with
     actor = feed.client, capsule = capsule feed (content feed payloadFull), round
@@ -264,6 +269,37 @@ testRejectsPartialDataPoint = do
   (_, result) <- verifyAsClient feed c
   result === Api.Rejected ["data point feeds differ from the verifier's"]
 
+-- | The schema version is in no package, so the verifier fixes it: a capsule
+-- carries exactly its own. The commitment covers the payload alone, so a
+-- relabelled capsule still passes canonicality; authenticity is what binds
+-- the two.
+testRejectsWrongSchemaVersion : Script ()
+testRejectsWrongSchemaVersion = do
+  feed <- setup
+  let c = content feed payloadFull
+      relabelled = c with dataPoint = c.dataPoint with schemaVersion = "redstone-2"
+  (ownVerifier, result) <- verifyAsClient feed relabelled
+  result === Api.Rejected ["data point schema version differs from the verifier's"]
+  round <- attest feed (capsuleRound feed)
+  canonical <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+    actor = feed.client, capsule = capsule feed relabelled, round
+  canonical === Api.Passed
+
+-- | The metadata is in no package and the verifier does not fix it: the
+-- capsule signatory's annotation, which both checks pass over.
+testMetadataIsNotVerified : Script ()
+testMetadataIsNotVerified = do
+  feed <- setup
+  let c = content feed payloadFull
+      annotations = Metadata with values = TM.fromList [("redstone.finance/source", "gateway")]
+      annotated = c with dataPoint = c.dataPoint with metadata = annotations
+  (ownVerifier, result) <- verifyAsClient feed annotated
+  result === Api.Verified expectedDataHash
+  round <- attest feed (capsuleRound feed)
+  canonical <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+    actor = feed.client, capsule = capsule feed annotated, round
+  canonical === Api.Passed
+
 testRejectsWrongFixingTime : Script ()
 testRejectsWrongFixingTime = do
   feed <- setup
@@ -271,6 +307,18 @@ testRejectsWrongFixingTime = do
         dataPoint = dataPoint feed.operator (addRelTime fixingTime (seconds 1)) medianValues
   (_, result) <- verifyAsClient feed c
   result === Api.Rejected ["payload packages rejected: Timestamp too old"]
+
+-- | A fixing time inside the packages' millisecond is rejected, so a payload
+-- stands for one fixing time and cannot be published again a microsecond
+-- later as the next round.
+testRejectsFractionalFixingTime : Script ()
+testRejectsFractionalFixingTime = do
+  feed <- setup
+  forA_ [1, 999] $ \micros -> do
+    let c = (content feed payloadFull) with
+          dataPoint = dataPoint feed.operator (addRelTime fixingTime (microseconds micros)) medianValues
+    (_, result) <- verifyAsClient feed c
+    result === Api.Rejected ["fixing time is not a whole millisecond"]
 
 testRejectsMalformedPayload : Script ()
 testRejectsMalformedPayload = do
@@ -319,6 +367,26 @@ testRejectsUnattestedRound = do
   replayed <- check other.attestation
   replayed === Api.Failed ["round attestation matches no key"]
 
+-- | The attestation vector of `docs/off-ledger.md`: the digest signed for
+-- round 1 of `payloadFull`, and a signature over it by the first test node
+-- key.
+attestationVectorDigest, attestationVectorSignature : Text
+attestationVectorDigest = "0a6826c837abbe82a59f51d532c8e572e054215707346c00029c7fe8d1c72e34"
+attestationVectorSignature = "3045022100bdbe3c37aa32885baedc4f3b6a6fdf3064ccb841e1ed7e269b8735b289743a4c022010a280931c69706e0378e12a60b5c98bf6ef4de93a873c49c9e7e01ae74ae802"
+
+testAttestationVector : Script ()
+testAttestationVector = do
+  feed <- setup
+  let round = capsuleRound feed
+      key :: _ = testSigners
+  attestationMessage round === attestationVectorDigest
+  passed <- verifyRoundWith feed [key] $ round with attestation = Some attestationVectorSignature
+  passed === Api.Passed
+  -- The same signature under another key of the test set matches nothing.
+  let _ :: other :: _ = testSigners
+  failed <- verifyRoundWith feed [other] $ round with attestation = Some attestationVectorSignature
+  failed === Api.Failed ["round attestation matches no key"]
+
 -- | An attestation key checks in every form `signers` may take: the 65-byte
 -- point, the 64-byte X||Y without the 04 prefix, and DER (SPKI) in either
 -- case.
@@ -344,9 +412,10 @@ testRejectsMalformedAttestationKey = do
   both <- verifyRoundWith feed ["zz"] (capsuleRound feed)
   both === Api.Failed ["verifier attestation key is not a public key", "round carries no attestation"]
 
--- | An attestation that is not a DER signature, a node's r‖s‖v among them,
--- fails the check instead of aborting it; a DER envelope around no valid
--- signature matches no key.
+-- | An attestation that is not a DER signature, a node's r‖s‖v and a DER
+-- envelope around anything but two scalars among them, fails the check
+-- instead of aborting it; two scalars that are no valid signature match no
+-- key.
 testRejectsMalformedAttestation : Script ()
 testRejectsMalformedAttestation = do
   feed <- setup
@@ -354,7 +423,7 @@ testRejectsMalformedAttestation = do
       -- Key 1's signature over its package in `payloadFull`.
       nodeSignature = "246bb043828e9ace345e79dca7f457a6029fa190d99cb2ba7ccced521ab9056a59f03d1074528012e05caf9b98f48cac66dcc8f67561658673ce1d69a6cc398c1b"
       check signature = verifyRoundWith feed [signersFormat feed.attester] round with attestation = Some signature
-  forA_ ["zz", "30", "3006020100", nodeSignature] $ \signature -> do
+  forA_ (["zz", "30", "3006020100", nodeSignature] <> malformedDerSignatures) $ \signature -> do
     result <- check signature
     result === Api.Failed ["round attestation is not a DER signature"]
   empty <- check "3006020100020100"
@@ -382,10 +451,10 @@ testRejectsRoundOfAnotherDefinition = do
   otherVerifier <- submit feed.operator $ createCmd RedStoneVerifier with
     owner = feed.operator, observers = []
     signers = testSigners, signerCountThreshold = 3, feedIds = ["SOL"]
-    attestationKeys = [signersFormat otherAttester]
+    schemaVersion = testSchemaVersion, attestationKeys = [signersFormat otherAttester]
     maxBehind = hours 1, maxAhead = minutes 5
   proposal <- submit feed.operator $ createCmd DefinitionProposal with
-    dataId = "SOL", operator = feed.operator, auditors = [], readers = []
+    dataId = "SOL", operator = feed.operator, auditors = [], readers = [], headObservers = []
     verifier = toInterfaceContractId otherVerifier, publishers = None, accepted = []
   (otherDefinition, _) <- submit feed.operator $ exerciseCmd proposal DefinitionProposal_Finalize
   round <- attest feed (capsuleRound feed) with definition = toInterfaceContractId otherDefinition
@@ -460,7 +529,7 @@ testPublishAndDistributeRedStoneRound = do
   own <- submit feed.client $ createCmd RedStoneVerifier with
     owner = feed.client, observers = []
     signers = testSigners, signerCountThreshold = 3, feedIds = ["BTC", "ETH"]
-    attestationKeys = [signersFormat feed.attester]
+    schemaVersion = testSchemaVersion, attestationKeys = [signersFormat feed.attester]
     maxBehind = hours 1, maxAhead = minutes 5
   let ownVerifier = toInterfaceContractId @Api.Verifier own
   verified <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_Verify with
@@ -481,7 +550,7 @@ testVerifiesProductionPayload = do
   own <- submit feed.client $ createCmd RedStoneVerifier with
     owner = feed.client, observers = []
     signers = redstone_primary_prod_public_keys, signerCountThreshold = 3
-    feedIds = ["BTC", "ETH"], attestationKeys = [], maxBehind = hours 1, maxAhead = minutes 5
+    feedIds = ["BTC", "ETH"], schemaVersion = testSchemaVersion, attestationKeys = [], maxBehind = hours 1, maxAhead = minutes 5
   let ownVerifier = toInterfaceContractId @Api.Verifier own
       c = Api.CapsuleContent with
         dataPoint = dataPoint feed.operator productionFixingTime productionValues

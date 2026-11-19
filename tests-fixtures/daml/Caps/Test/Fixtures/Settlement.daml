@@ -3,43 +3,149 @@
 
 -- | A settlement between two parties, for the tests of a consumer that uses
 -- a capsule in a transaction with another party. `a` settles alone, on a
--- capsule and a round view it supplies, and the contract runs the
--- verifier's checks on them before it settles. `b` consented when it signed
--- the contract and has no later moment to compare the view with the round
--- on its own participant, so the round's attestation is what it relies on.
+-- capsule and a round it supplies, and the contract runs the verifier's
+-- checks on them and holds the round to the fixing the parties agreed
+-- before it settles. `b` consented when it signed the contract and has no
+-- later moment to compare the view with the round it reads, so the round's
+-- attestation is what it relies on, unless `a` settles on the round itself,
+-- fetched from the ledger.
 module Caps.Test.Fixtures.Settlement where
+
+import DA.Foldable (forA_)
 
 import qualified Caps.Api.CoreV1 as Api
 import DataStandard.DataPointV1 (PublishedDataPointView)
+
+-- | The fixing the parties agreed to settle on. Freshness admits every round
+-- of its window, so without a rule the settling party chooses among them.
+data FixingRule
+  = AnyFreshRound
+    -- ^ No rule: any round that passes the checks.
+  | RoundNumber Int
+    -- ^ The round of this number.
+  | FixingTime Time
+    -- ^ The round fixed at exactly this time.
+  | FirstRoundAtOrAfter Time
+    -- ^ The first round fixed at this time or later, shown with the round
+    -- before it.
+  deriving (Eq, Show, Serializable)
 
 template Settlement
   with
     a : Party
     b : Party
+    definition : ContractId Api.DataDefinition
+      -- ^ The data set both parties pinned.
     verifier : ContractId Api.Verifier
       -- ^ An instance with the parameters both parties pinned, visible to
       -- `a`, who exercises it.
+    roundSignatories : [Party]
+      -- ^ The signatories of the definition both parties pinned; a round
+      -- fetched from the ledger must carry them.
+    fixing : FixingRule
   where
     signatory a, b
 
     -- | Settle on `capsule` at `round`: authentic, canonical (attestation
-    -- included) and fresh at ledger time, or the transaction fails.
+    -- included), fresh at ledger time and the agreed fixing, or the
+    -- transaction fails.
     choice Settlement_Settle : ContractId Settled
       with
         capsule : Api.CapsuleView
         round : Api.RoundView
       controller a
       do
-        authentic <- exercise verifier Api.Verifier_Verify with actor = a, capsule
-        case authentic of
-          Api.Verified _ -> pure ()
-          Api.Rejected reasons -> abort $ "not authentic: " <> show reasons
-        require "not canonical" =<< exercise verifier Api.Verifier_VerifyRound with
-          actor = a, capsule, round
-        now <- getTime
-        require "not fresh" =<< exercise verifier Api.Verifier_VerifyFreshness with
-          actor = a, capsule, asOf = now
-        create Settled with a, b, roundNumber = round.roundNumber, dataPoint = capsule.content.dataPoint
+        agreed fixing round None
+        settle this capsule round
+
+    -- | Settle on `capsule` at the round the ledger holds under `round`,
+    -- which `a` need not be a stakeholder of.
+    choice Settlement_SettleOnRound : ContractId Settled
+      with
+        capsule : Api.CapsuleView
+        round : ContractId Api.Round
+      controller a
+      do
+        roundView <- exercise round Api.Round_Fetch with
+          actor = a, signatories = roundSignatories
+        agreed fixing roundView None
+        settle this capsule roundView
+
+    -- | `Settlement_Settle` with the round before, as a capsule and a view
+    -- that pass the same checks: what `FirstRoundAtOrAfter` needs from a
+    -- party that supplies views.
+    choice Settlement_SettleWithPrevious : ContractId Settled
+      with
+        capsule : Api.CapsuleView
+        round : Api.RoundView
+        previousCapsule : Api.CapsuleView
+        previous : Api.RoundView
+      controller a
+      do
+        verified this previousCapsule previous
+        agreed fixing round $ Some previous
+        settle this capsule round
+
+    -- | `Settlement_SettleOnRound` with the round before, both as the
+    -- ledger holds them.
+    choice Settlement_SettleOnRounds : ContractId Settled
+      with
+        capsule : Api.CapsuleView
+        round : ContractId Api.Round
+        previous : ContractId Api.Round
+      controller a
+      do
+        roundView <- exercise round Api.Round_Fetch with
+          actor = a, signatories = roundSignatories
+        previousView <- exercise previous Api.Round_Fetch with
+          actor = a, signatories = roundSignatories
+        agreed fixing roundView $ Some previousView
+        settle this capsule roundView
+
+-- | Abort unless `round` is the fixing `rule` names, given the round before
+-- it where the rule needs one.
+agreed : FixingRule -> Api.RoundView -> Optional Api.RoundView -> Update ()
+agreed rule round previous = forA_ (broken rule round previous) abort
+
+-- | Why `round` is not the fixing `rule` names; None when it is.
+broken : FixingRule -> Api.RoundView -> Optional Api.RoundView -> Optional Text
+broken AnyFreshRound _ _ = None
+broken (RoundNumber number) round _
+  | round.roundNumber /= number = Some "not the agreed round"
+  | otherwise = None
+broken (FixingTime time) round _
+  | round.timestamp /= time = Some "not the agreed fixing time"
+  | otherwise = None
+broken (FirstRoundAtOrAfter _) _ None = Some "the rule needs the round before"
+broken (FirstRoundAtOrAfter time) round (Some previous)
+  | previous.definition /= round.definition = Some "the round before is of another definition"
+  | previous.roundNumber + 1 /= round.roundNumber = Some "not the round before"
+  | round.timestamp < time = Some "the round is fixed before the agreed time"
+  | previous.timestamp >= time = Some "an earlier round is fixed at or after the agreed time"
+  | otherwise = None
+
+-- | Abort unless `capsule` is of the pinned data set, authentic and
+-- canonical at `round`.
+verified : Settlement -> Api.CapsuleView -> Api.RoundView -> Update ()
+verified Settlement{a, definition, verifier} capsule round = do
+  assertMsg "capsule of another definition" $ capsule.definition == definition
+  authentic <- exercise verifier Api.Verifier_Verify with actor = a, capsule
+  case authentic of
+    Api.Verified _ -> pure ()
+    Api.Rejected reasons -> abort $ "not authentic: " <> show reasons
+  require "not canonical" =<< exercise verifier Api.Verifier_VerifyRound with
+    actor = a, capsule, round
+
+-- | Run the checks on `capsule` at `round` and record the settlement.
+settle : Settlement -> Api.CapsuleView -> Api.RoundView -> Update (ContractId Settled)
+settle settlement capsule round = do
+  verified settlement capsule round
+  now <- getTime
+  require "not fresh" =<< exercise settlement.verifier Api.Verifier_VerifyFreshness with
+    actor = settlement.a, capsule, asOf = now
+  create Settled with
+    a = settlement.a, b = settlement.b
+    roundNumber = round.roundNumber, dataPoint = capsule.content.dataPoint
 
 -- | What a settlement records.
 template Settled

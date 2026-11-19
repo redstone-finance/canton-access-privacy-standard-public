@@ -9,10 +9,11 @@ to the feed's readers, plus a root capsule carrying the data. Licensees
 redistribute the data by deriving capsules scoped to their own clients. The
 operator is a stakeholder of none of those capsules. A consumer proves what it
 received with two local checks: authenticity, against a verifier it
-instantiated itself, and canonicality, against the round it read from its own
-participant.
+instantiated itself, and canonicality, against the round it read from a
+participant hosting the reader.
 
-The standard builds on the [Canton Data Standard](https://github.com/kaikodata/canton-data-standard):
+The standard builds on the
+[Canton Data Standard](https://github.com/kaikodata/canton-data-standard):
 every capsule implements its `PublishedDataPoint` interface, so a consumer
 written against that standard reads a CAPS capsule unchanged, and payloads use
 its `AnyValue` type.
@@ -21,13 +22,13 @@ its `AnyValue` type.
 
 | Path | Package | What it is |
 |---|---|---|
-| `interfaces/caps-api-core-v1` | `caps-api-core-v1` | The seven interfaces: `DataDefinition`, `Verifier`, `RoundHead`, `Round`, `License`, `LicenseDelegate`, `Capsule`, plus the shared `CapsuleContent`, `CapsuleSource` and `CreateRoundResult` types. Views and choices only; no executable code, because an interface package cannot be smart-contract-upgraded. |
+| `interfaces/caps-api-core-v1` | `caps-api-core-v1` | The seven interfaces: `DataDefinition`, `Verifier`, `RoundHead`, `Round`, `License`, `LicenseDelegate`, `Capsule`, plus the shared `CapsuleContent`, `CapsuleSource` and `CreateRoundResult` types. Views and choices only; no executable code beyond the check of signatories in `Round_Fetch`, because an interface package cannot be smart-contract-upgraded. |
 | `caps-core` | `caps-core` | The reference implementation of the five data-path interfaces, generic over the oracle: templates for `DataDefinition` (with its bootstrap proposal), `RoundHead`, `Round`, `License` and `Capsule`. The reference license calls its `LicenseDelegate`, when it names one. The only vendor-specific contract a deployment adds is a `Verifier`. |
-| `caps-capsule-archiver` | `caps-capsule-archiver` | Retention for capsules, through the `RoundHead` and `Capsule` interfaces alone: a `CapsuleArchiver` of one distributor for one data definition archives, for any actor that sees it and names the definition's round head, the distributor's capsules at least `keptRounds` rounds behind the head's latest round once `keepPeriod` has passed since their publication, the retention a RedStone price pill follows. |
+| `caps-capsule-archiver` | `caps-capsule-archiver` | Retention for capsules, through the `Capsule` interface alone: a `CapsuleArchiver` of one distributor for one data definition archives, for any actor that sees it and names the distributor's newest capsule, the distributor's capsules at least `keptRounds` rounds behind that capsule's round once `keepPeriod` has passed since their publication, the retention a RedStone price pill follows. |
 | `caps-round-archiver` | `caps-round-archiver` | Retention for rounds, through the `RoundHead` and `Round` interfaces alone: a `RoundArchiver` of the operator for one data definition retires, through `Round_Archive`, the rounds at least `keptRounds` behind the head's latest round once `keepPeriod` has passed since their fixing time, the capsule archiver's rule; the genesis round always stays. |
-| `tests-fixtures` | `caps-tests-fixtures` | `TestVerifier`, a cryptography-free verifier for exercising the reference implementation, and `Settlement`, a two-party contract that runs the checks on a supplied capsule and round view. Templates only, so the package carries no `daml-script` dependency. |
-| `tests` | `caps-tests` | Daml Script tests: bootstrap, publication and its rejections, the round attestation and the key holder's one candidate per round, a settlement on a supplied round view, the race on the head, pause, distribution by view and by id, sublicensing, revocation, the visibility claims, the RedStone verifier against payloads signed by test node keys, the Data Standard verifier against payloads signed by keys generated in the script, the capsule and round archivers on published rounds, and the extended licenses with the accounting delegate, its markers, merging and settlement. |
-| `deps/` | | Vendored DARs: the Canton Data Standard (`utils-v1` for `AnyValue` and `datapoint-v1` for `PublishedDataPoint`, which the interfaces depend on; `codecs` and `distributor-key-v1`, which the Data Standard verifier delegates to) and the RedStone Daml SDK (`redstone-sdk-v20`, `redstone-common-v20`) the RedStone verifier delegates to. |
+| `tests-fixtures` | `caps-tests-fixtures` | `TestVerifier`, a cryptography-free verifier for exercising the reference implementation, and `Settlement`, a two-party contract that runs the checks on a supplied capsule and round and holds the round to an agreed fixing rule, and the foreign templates and malformed signatures the tests attack with. No Daml Script, so the package carries no `daml-script` dependency. |
+| `tests` | `caps-tests` | Daml Script tests: bootstrap, publication and its rejections, the round attestation and the key holder's one candidate per round, a settlement on a supplied round view and on the ledger's round, held to an agreed fixing rule, the race on the head, pause, distribution by view and by id, sublicensing, revocation, the visibility claims, the RedStone verifier against payloads signed by test node keys, the Data Standard verifier against payloads signed by keys generated in the script, the capsule and round archivers on published rounds, and the extended licenses with the accounting delegate, its markers, merging and settlement. |
+| `deps/` | | Vendored DARs: the Canton Data Standard (`utils-v1` for `AnyValue` and `datapoint-v1` for `PublishedDataPoint`, which the interfaces depend on; `codecs` and `distributor-key-v1`, which the Data Standard verifier delegates to) and the RedStone Daml SDK (`redstone-sdk-v1`) the RedStone verifier delegates to. |
 
 ## The model
 
@@ -54,10 +55,10 @@ section 5 and walked through in
 
 1. **Authenticity**: `Verifier_Verify` on its own verifier instance, created
    from the template the definition's `verifier` points to.
-2. **Canonicality**: `Verifier_VerifyRound` with the `Round` view read from its
-   own participant or, for a consumer that cannot read the round, the view the
-   presenter hands over next to the capsule, which the round's attestation
-   makes checkable.
+2. **Canonicality**: `Verifier_VerifyRound` with the `Round` view read from a
+   participant hosting the reader or, for a consumer that cannot read the
+   round, the view the presenter hands over next to the capsule, which the
+   round's attestation makes checkable.
 3. **Freshness**: `Verifier_VerifyFreshness` with the time it cares about,
    or its own bound on `content.dataPoint.publishedAt`.
 4. **License**: the license's `owner` is the capsule's distributor and its
@@ -76,8 +77,9 @@ consumes, the canonical verifier and the root license, whose licensees
 become the root capsule's audience; the head carries the latest round's
 number and fixing time, so no round is fetched. Publishing is therefore
 open to whoever sees all three: the operator and the root license's
-licensees by observation, anyone else by explicit disclosure of the three
-contracts.
+licensees the head names among its observers by observation, where the
+canonical verifier names them among its observers too, anyone else by
+explicit disclosure of the three contracts.
 
 ## Extensions
 
@@ -93,9 +95,9 @@ and how to write an extension.
 
 | Path | Package | What it is |
 |---|---|---|
-| `extensions/caps-verifier-redstone` | `caps-verifier-redstone` | A `Verifier` for RedStone oracle data: the capsule payload is a RedStone payload as the nodes sign it, verified by the RedStone Daml SDK (keccak256, secp256k1, m-of-n distinct signers, median). The round commitment is the keccak256 of the signed payload, which every capsule carries verbatim. |
+| `extensions/caps-verifier-redstone` | `caps-verifier-redstone` | A `Verifier` for RedStone oracle data: the capsule payload is a RedStone payload as the nodes sign it, verified by the RedStone Daml SDK (keccak256, secp256k1, m-of-n distinct signers, median). The round commitment is the keccak256 of the signed payload, which every capsule carries verbatim; the data point, under the verifier's schema version, is bound to it by the authenticity check; its metadata is the distributor's annotation, unverified. |
 | `extensions/caps-verifier-datastandard` | `caps-verifier-datastandard` | The standard's default `Verifier`, for data signed in the Canton Data Standard's own envelope: the data point is the signed content, the payload carries `expiresAt` and one signature per node, and `DataStandard.Codecs.Verify` checks them against m-of-n configured keys. The round commitment is the envelope's structural root hash, the Data Standard's `canonicalHash`. |
-| `extensions/caps-extended-licensing` | `caps-extended-licensing` | License kinds beyond the reference: the open `OpenLicense` (paid by use, sublicensable, the root) and the prepaid `ConsumableLicense`, `SubscriptionLicense` and `CreditLicense` a sublicense is created as, selected by its `licenseType`. Each reports its distributions, priced, to its delegate. |
+| `extensions/caps-extended-licensing` | `caps-extended-licensing` | License kinds beyond the reference: the open `OpenLicense` (paid by use, sublicensable, the root) and the prepaid `ConsumableLicense`, `SubscriptionLicense` and `CreditLicense` a sublicense is created as, selected by its `licenseType`. Each reports its distributions, priced, to its delegate; the consumable and credit licenses, consumed on every distribution, are seen by the operator and the licensor through a `LicenseGrant` rather than observed. |
 | `extensions/caps-accounting` | `caps-accounting` | The reference implementation of accounting, as a `LicenseDelegate`: `AccountingDelegate`, signed by its owner and observed by its accountants and the licensees who sublicense through it, leaves a `DistributionMarker` per distribution its owner reports, signed by the distributor and observed by the accountants, which either side merges and the accountants settle. Serves any license that names it: at the weight the license passes in the context, or at 1.0 when it passes none. |
 
 ### Accounting (optional)
@@ -128,31 +130,36 @@ and the delegates and markers are absent.
 |---|---|
 | [specification.md](docs/specification.md) | The normative requirements on a deployment, a verifier and a consumer, interface by interface. |
 | [data-model.md](docs/data-model.md) | Every type, view and field; identity; payload encodings; lifecycle and visibility tables. |
-| [consumer-guide.md](docs/consumer-guide.md) | Onboarding and the five checks, with Daml Script fragments. |
+| [consumer-guide.md](docs/consumer-guide.md) | Onboarding, the five checks and which round a transaction settles on, with Daml Script fragments. |
 | [implementer-guide.md](docs/implementer-guide.md) | Writing a verifier, publishing with an existing oracle, what may be replaced. |
+| [off-ledger.md](docs/off-ledger.md) | The handoffs outside the ledger, what a presentation carries, verification without a participant, encodings and vectors. |
 | [extensions.md](docs/extensions.md) | The extension points, the shipped extensions, writing an extension. |
 | [governance.md](docs/governance.md) | Who signs the head and the rounds, the variants considered, the decision. |
-| [lifecycle.md](docs/lifecycle.md) | How each contract is created, replaced and retired; retention; open gaps. |
+| [lifecycle.md](docs/lifecycle.md) | How each contract is created, replaced and retired; retention. |
+| [costs.md](docs/costs.md) | Contracts per publication and per distribution, per year and under retention; what a deployment may give up to pay less. |
 | [licensing.md](docs/licensing.md) | The license, provenance, what a client can check, the license kinds. |
 | [accounting.md](docs/accounting.md) | The optional distribution marker, merging, settlement, variants, audit. |
 | [threat-model.md](docs/threat-model.md) | What CAPS proves, polices and leaves out of reach. |
+| [round-compaction.md](docs/round-compaction.md) | A possible extension that folds retired rounds into a tree. |
 | [glossary.md](docs/glossary.md) | The terms. |
 
 ## Build
 
 Requirements: `dpm` (the Daml Package Manager) with Daml SDK `3.5.12`
-(`dpm install 3.5.12`), and a JDK (17+).
+(`dpm install 3.5.12`), a JDK (17+), and `jq` for `make dars-check`.
 
 ```bash
 make build          # dpm build --all
 make test           # run the Daml Script test suite
-make validate       # validate the built interface DARs
+make visibility     # check who each test transaction is disclosed to
+make validate       # validate the built DARs
 make lint           # dlint over the Daml sources
-make headers-check  # every source file carries the license header
+make headers-check  # every Daml source file carries the license header
 make dars           # refresh the committed DARs in dars/
 make dars-check     # prove the committed DARs match a from-source rebuild
 make clean          # dpm clean --all
-make ci             # headers-check, build, validate, test, dars-check
+make ci             # headers-check, build, validate, test, visibility,
+                    # dars-check
 ```
 
 ## License

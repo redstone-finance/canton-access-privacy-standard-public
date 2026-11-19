@@ -1,0 +1,208 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Who each test transaction is disclosed to, witnesses included, held
+-- against the privacy rules of the standard. A query only sees active
+-- contracts, so a party that witnessed a contract's creation without being
+-- its stakeholder passes every query; `dpm test --transactions-output`
+-- records each node with all the parties it was disclosed to, and
+-- `scripts/visibility-json.sh` turns that record into the input of `check`.
+-- Run by `make visibility`.
+module Test.Visibility where
+
+import DA.Action (unless)
+import DA.Foldable (forA_)
+import DA.List (dedup, dedupOn)
+import DA.Optional (isNone, optionalToList)
+import qualified DA.Text as T
+import Daml.Script
+
+-- Input ---------------------------------------------------------------------
+
+-- | One transaction node of one test.
+data Node = Node with
+    test : Text
+      -- ^ The test module and test name, `CoreTest:setup`.
+    tx : Int
+    node : Text
+      -- ^ The node id, `#tx:index`.
+    root : Text
+      -- ^ The label of the transaction's root action.
+    actors : [Text]
+      -- ^ The roles of the parties acting at the root.
+    label : Text
+      -- ^ `create T`, `exercise C` or `fetch T`.
+    disclosedTo : [Text]
+      -- ^ Roles: the allocation hints of the parties, without trailing
+      -- digits, so Auditor1 and Auditor2 are both Auditor.
+  deriving (Eq, Show, Serializable)
+
+-- Rules ---------------------------------------------------------------------
+
+-- | The roles allowed to learn of the `label` nodes of a transaction whose
+-- root action is `root`; label "*" covers every node of that transaction.
+data Rule = Rule with
+    root : Text
+    label : Text
+    roles : [Text]
+
+-- | A role told of a node it is not allowed to learn of.
+data Leak = Leak with
+    root : Text
+    label : Text
+    role : Text
+  deriving (Eq, Ord, Show)
+
+publication : Text
+publication = "exercise RoundHead_CreateRound"
+
+sublicense : Text
+sublicense = "exercise License_CreateSublicense"
+
+distribution : Text
+distribution = "exercise License_Distribute"
+
+-- | The parties the tests make readers of a definition.
+readers : [Text]
+readers = ["Reader", "Publisher", "Licensee"]
+
+-- | Stands in a rule for whoever acts at the root of the transaction, in
+-- place of a role: the owner of the license in a distribution, at any level
+-- of the chain.
+actor : Text
+actor = "<actor>"
+
+-- | Section 4 of the CIP as roles. A publication carries the price in the
+-- verifier checks and the root capsule, which only the operator, the
+-- auditors, the publisher and the root licensees may see; readers learn of
+-- the round and the head. A distribution informs the owner, who acts, and
+-- the new capsule's clients, the accountants of its marker and the source
+-- capsule's distributor of a fetch by id only, so a licensee up the chain
+-- learns of no distribution a sublicensee makes by view; a prepaid license
+-- is spent out of the operator's view. A consumer's own checks inform the
+-- consumer alone; fetching a round informs its signatories and no reader.
+-- Retiring a capsule informs its stakeholders, the clients of a distributed
+-- one among them.
+rules : [Rule]
+rules =
+  [ Rule publication "*" ["Operator", "Auditor", "Publisher", "Stranger", "Licensee"]
+  , Rule publication "create Round" readers
+  , Rule publication "create RoundHead" readers
+  , Rule publication "fetch License" readers
+  , Rule publication "fetch OpenLicense" readers
+  , Rule sublicense "*" ["Operator", "Licensee", "Client", "Consumer"]
+  , Rule sublicense "create AccountingDelegate" ["Accountant"]
+  , Rule distribution "*" [actor, "Client", "Consumer"]
+  , Rule distribution "create Capsule" ["Accountant"]
+  , Rule distribution "create DistributionMarker" ["Accountant"]
+  , Rule distribution "fetch Capsule" ["Operator", "Licensee"]
+  , Rule "exercise PublishedDataPoint_Fetch" "*" ["Licensee", "Client", "Consumer"]
+  , Rule "exercise Verifier_Verify" "*" ["Client", "Consumer"]
+  , Rule "exercise Verifier_VerifyRound" "*" ["Client", "Consumer"]
+  , Rule "exercise Verifier_VerifyFreshness" "*" ["Client", "Consumer"]
+  , Rule "exercise Settlement_Settle" "*" ["Client", "Consumer"]
+  , Rule "exercise Settlement_SettleOnRound" "*" ["Client", "Consumer"]
+  , Rule "exercise Settlement_SettleOnRound" "exercise Round_Fetch" ["Operator", "Auditor"]
+  , Rule "exercise Settlement_SettleWithPrevious" "*" ["Client", "Consumer"]
+  , Rule "exercise Settlement_SettleOnRounds" "*" ["Client", "Consumer"]
+  , Rule "exercise Settlement_SettleOnRounds" "exercise Round_Fetch" ["Operator", "Auditor"]
+  , Rule "exercise Round_Fetch" "*" [actor, "Operator", "Auditor"]
+  , Rule "exercise License_Revoke" "*" ["Operator", "Licensee", "Client"]
+  , Rule "exercise OpenLicense_Revoke" "*" ["Operator", "Licensee", "Consumer"]
+  , Rule "exercise LicenseGrant_Revoke" "*" ["Operator", "Licensee", "Consumer"]
+  , Rule "exercise DistributionMarker_Close" "*" ["Accountant", "Licensee"]
+  , Rule "exercise DistributionMarker_Merge" "*" ["Accountant", "Licensee"]
+  , Rule "exercise DefinitionProposal_Accept" "*" ["Operator", "Auditor"]
+  , Rule "exercise DefinitionProposal_Cancel" "*" ["Operator", "Auditor"]
+  , Rule "exercise DefinitionProposal_Finalize" "*" ["Operator", "Auditor"]
+  , Rule "exercise DefinitionProposal_Finalize" "create DataDefinition" readers
+  , Rule "exercise DefinitionProposal_Finalize" "create Round" readers
+  , Rule "exercise DefinitionProposal_Finalize" "create RoundHead" readers
+  , Rule "exercise RoundHead_Pause" "*" ("Operator" :: "Auditor" :: readers)
+  , Rule "exercise RoundHead_Resume" "*" ("Operator" :: "Auditor" :: readers)
+  , Rule "exercise Round_Archive" "*" ("Operator" :: "Auditor" :: readers)
+  , Rule "exercise RoundArchiver_Archive" "*" ["Operator", "Auditor"]
+  , Rule "exercise RoundArchiver_Archive" "exercise Round_Archive" readers
+  , Rule "exercise CapsuleArchiver_Archive" "*" [actor, "Operator", "Licensee"]
+  , Rule "exercise CapsuleArchiver_Archive" "exercise Archive" ["Auditor", "Client", "Consumer"]
+  ]
+
+-- | Readers observed the head and `RoundHead_CreateRound` consumes it, so
+-- every reader witnessed the whole publication, price included, until the
+-- head's observers were kept within the root capsule's audience. No rule may
+-- admit it again.
+readersWitnessPublication : [Leak]
+readersWitnessPublication =
+  [ Leak publication label "Reader"
+  | label <-
+      [ publication
+      , "exercise Verifier_Verify"
+      , "exercise Verifier_VerifyFreshness"
+      , "exercise Verifier_VerifyRound"
+      , "create Capsule"
+      ]
+  ]
+
+-- | A capsule's archival is told to its stakeholders: the auditors for a
+-- root capsule and never for a distributed one, the clients for a
+-- distributed one and never for a root one. An archival told to both is a
+-- root capsule's that reached a client, which the rule for
+-- `CapsuleArchiver_Archive` cannot tell from a distributed capsule's.
+rootArchivalToldToAClient : Node -> Bool
+rootArchivalToldToAClient n =
+  n.root == "exercise CapsuleArchiver_Archive" && n.label == "exercise Archive"
+    && "Auditor" `elem` n.disclosedTo && "Client" `elem` n.disclosedTo
+
+-- | Leaks the implementation still has. `check` fails once one of them
+-- stops occurring, so its entry goes with the fix.
+knownLeaks : [Leak]
+knownLeaks = []
+
+-- Check ---------------------------------------------------------------------
+
+allowed : Text -> Text -> Optional [Text]
+allowed root label = case [r.roles | r <- rules, r.root == root, r.label == "*"] of
+  [] -> None
+  base :: _ -> Some (base <> concat [r.roles | r <- rules, r.root == root, r.label == label])
+
+describe : (Leak, Node) -> Text
+describe (leak, n) =
+  leak.role <> " on " <> leak.label <> " under " <> leak.root
+    <> " (" <> n.test <> ", TX " <> show n.tx <> ", " <> n.node <> ")"
+
+-- | Fails on a root action no rule covers, on a leak not in `knownLeaks`,
+-- and on a known leak that no longer occurs. A transaction whose root is a
+-- create informs that contract's stakeholders only, so it is not checked.
+check : [Node] -> Script ()
+check nodes = do
+  let checked = filter (\n -> not ("create " `T.isPrefixOf` n.root)) nodes
+      unruled = dedup [n.root | n <- checked, isNone (allowed n.root n.label)]
+      leaks =
+        [ (Leak n.root n.label role, n)
+        | n <- checked
+        , roles <- optionalToList (allowed n.root n.label)
+        , role <- n.disclosedTo
+        , role `notElem` roles
+        , actor `notElem` roles || role `notElem` n.actors
+        ]
+      isKnown (leak, _) = leak `elem` knownLeaks
+      expected = filter isKnown leaks
+      unexpected = filter (not . isKnown) leaks
+      gone = filter (`notElem` map fst leaks) knownLeaks
+      readmitted =
+        [ l
+        | l <- readersWitnessPublication
+        , roles <- optionalToList (allowed l.root l.label)
+        , l.role `elem` roles
+        ]
+      problems =
+        [ "no visibility rule for: " <> T.intercalate ", " unruled | not (null unruled) ]
+        <> [ "visibility leak: " <> describe l | l <- dedupOn fst unexpected ]
+        <> [ "known leak no longer occurs, drop it: " <> show l | l <- gone ]
+        <> [ "a rule admits a fixed leak: " <> show l | l <- readmitted ]
+        <> [ "visibility leak: Client on the archival of a root capsule ("
+               <> n.test <> ", TX " <> show n.tx <> ", " <> n.node <> ")"
+           | n <- take 1 $ filter rootArchivalToldToAClient checked ]
+  debug $ "visibility: " <> show (length nodes) <> " nodes, " <> show (length checked) <> " checked"
+  forA_ (dedupOn fst expected) $ \l -> debug $ "known leak: " <> describe l
+  unless (null problems) $ abort $ T.intercalate "\n" problems

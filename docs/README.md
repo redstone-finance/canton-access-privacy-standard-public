@@ -6,10 +6,13 @@ Where to start depends on what you are doing.
 |---|---|
 | Understand what the standard guarantees and to whom | [specification.md](specification.md), then [threat-model.md](threat-model.md) |
 | Consume capsules in an application | [consumer-guide.md](consumer-guide.md) |
+| Receive or verify capsules outside the ledger | [off-ledger.md](off-ledger.md) |
 | Bring an oracle onto the standard or replace a part of the reference | [implementer-guide.md](implementer-guide.md) |
 | Look up a field, a type or who sees what | [data-model.md](data-model.md) |
 | Decide how a feed is governed and who can stop or fork it | [governance.md](governance.md) |
 | Decide what to keep and for how long | [lifecycle.md](lifecycle.md) |
+| Size a deployment and choose what to pay for | [costs.md](costs.md) |
+| Keep who reads a feed off the ledger | [lifecycle.md](lifecycle.md), the readers; [threat-model.md](threat-model.md) |
 | Extend the standard with a package of your own | [extensions.md](extensions.md) |
 | License data and police who distributes it | [licensing.md](licensing.md) |
 | Bill for distribution | [accounting.md](accounting.md) |
@@ -42,17 +45,23 @@ Where to start depends on what you are doing.
   trade-off between excluding a fork and surviving a signatory, the
   variants considered and the decision to keep the reference as it is.
 - [lifecycle.md](lifecycle.md): how each contract is created, replaced and
-  retired, retention, and the gaps still open.
+  retired, and retention.
+- [costs.md](costs.md): the contracts each role gains per publication and
+  per distribution, what that comes to per year and under retention, and
+  what a deployment may give up to pay less.
 - [round-compaction.md](round-compaction.md): a possible extension, not
   shipped, that folds retired rounds into a tree instead of dropping them.
 
 **Guides**
 
-- [consumer-guide.md](consumer-guide.md): onboarding and the five checks,
-  with Daml Script fragments.
+- [consumer-guide.md](consumer-guide.md): onboarding, the five checks and
+  which round a transaction settles on, with Daml Script fragments.
 - [implementer-guide.md](implementer-guide.md): writing a verifier,
   publishing with an existing oracle, what may be replaced and what may
   not.
+- [off-ledger.md](off-ledger.md): every handoff outside the ledger, what
+  a presentation carries, what can be checked without a participant, the
+  encodings and vectors of the shipped verifiers.
 
 **Analysis**
 

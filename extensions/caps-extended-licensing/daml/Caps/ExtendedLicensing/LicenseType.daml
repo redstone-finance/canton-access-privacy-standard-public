@@ -21,7 +21,7 @@ data LicenseTerms
     -- ^ Any number of distributions until this time, prepaid.
   | Credits Int
     -- ^ This many distributions, prepaid.
-  deriving (Eq, Show)
+  deriving (Eq, Show, Serializable)
 
 -- | The encoding: `{unit: "consumable"}`,
 -- `{unit: "subscription", validUntil: t}` and

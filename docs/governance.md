@@ -6,8 +6,7 @@ it. The interfaces fix none of this: pausing has no standard choice, and
 which parties sign the head and the rounds is the implementation's. This
 document describes what the reference implementation does, the trade-off
 every alternative has to make, the alternatives considered, and the
-decision to keep the reference as it is. It summarises the team's
-discussion of 15 and 16 October 2026.
+decision to keep the reference as it is.
 
 Out of scope: accounting ([accounting.md](accounting.md)), verifiers,
 retention ([lifecycle.md](lifecycle.md)).
@@ -43,7 +42,7 @@ Canton's topology (variant E).
 | Contract | Signatories | Observers | Note |
 |---|---|---|---|
 | `DataDefinition` | operator, auditors | readers | Created once through `DefinitionProposal`: the operator proposes, each auditor accepts, the operator finalizes. Never touched by a publication. |
-| `RoundHead` | operator, auditors | readers | One live contract per definition. Beyond the view's `definition`, `round` and `isPaused`: the parties, the canonical `verifier`, and `publishers` (`None` admits anyone, `Some []` the operator only). |
+| `RoundHead` | operator, auditors | the head's observers, within the root capsule's audience | One live contract per definition. Beyond the view's `definition`, `round`, `roundNumber` and `isPaused`: the latest round's fixing time, the parties, the canonical `verifier`, and `publishers` (`None` admits anyone, `Some []` the operator only). Its observers witness every publication in full, root capsule included, so a publication fails while one of them is outside the root capsule's audience; the readers observe the rounds alone. |
 | `Round` | operator, auditors | readers | Created in `RoundHead_CreateRound` with the fixing time and the verifier's commitment; the auditors' authority comes from the head, so a round cannot be minted or archived outside a choice. |
 | `Capsule` (root) | operator | root license's licensees, auditors | Created in the same transaction as the round. |
 
@@ -74,7 +73,7 @@ operator can neither pause nor resume.
 | Censorship by the operator's inaction | excluded | A publisher needs no action from the operator; the operator's participant only validates. |
 | Selective censorship by taking a node down | possible | The operator can switch its participant off for an inconvenient round. It is visible (a gap, timeouts), and another publisher can add the missed round after the node returns, within `maxBehind`. |
 | Blocking by a single auditor | possible | The outage or boycott of one auditor's participant stops publication, and so does one pause. |
-| Blocking by the operator | possible | Through its own participant. Does not affect distribution or consumption of existing capsules, where the operator is no party. |
+| Blocking by the operator | possible | Through its own participant. Does not affect distribution or consumption of existing capsules, where the operator is no party, except a settlement that exercises `Round_Fetch`. |
 | Dependence on data production | outside the model | The oracle's nodes sign independently of the operator; CAPS liveness concerns the step on the ledger. |
 | Dependence on the attestation key | outside the model, where rounds are attested | The key is the data producer's, and a producer that does not sign a candidate has not produced the round; publishers carry the signed candidate and cannot replace it. The signer is a small component off the ledger path, to be made available on its own. |
 
@@ -88,6 +87,21 @@ operator can neither pause nor resume.
 | Outage of any signatory's node | | yes, until the node returns; transactions time out, nothing is lost | mitigation: multi-hosting |
 | Another publisher | no | no | publishes without the operator if it sees the three contracts; where rounds are attested, carries the producer's signed candidate |
 | A consumer | no | no | verifies locally on its own verifier instance |
+
+### What an auditor must be
+
+Every property above holds for an auditor only as far as it is independent
+of the operator. On the ledger that takes at least its party in a namespace
+of its own, hosted on a participant the operator does not run: an auditor
+the operator hosts adds a signature and no guarantee. That much can be
+checked, since a party's id carries its namespace and the hosting of a
+party is visible to every member of the synchronizer. It is the necessary
+part, not the whole: whether the organisation behind the party is
+independent of the operator no ledger shows.
+
+One independent auditor already excludes a fork, since a fork takes the
+operator and every auditor. Each further auditor raises what a collusion
+takes, and adds a party whose outage or pause stops publication.
 
 ## Variants
 
@@ -308,17 +322,12 @@ the open questions below, not a plan.
 
 ## Open questions
 
-- How many auditors are expected for RedStone feeds, and are they separate
-  organisations with their own participants or parties hosted by RedStone?
-  The topological variants make sense only in the first case.
 - Is "detectable fork" (C) acceptable for financial feeds in place of
   "excluded" (A, D)? Proposed answer: no, but it is the feed operator's
   decision and should be a configuration.
 - Should a single pause stay the default (a fast brake) or a threshold from
   the start (resistance to one auditor)? Proposed: 1 for pause, a majority
   for resume, replacing the auditor as the valve.
-- In E, who is the distributor of root capsules and the owner of the root
-  license, and will regulated consumers accept a governance party as the
+- In E the governance party is the distributor of root capsules and the
+  owner of the root license: will regulated consumers accept it as the
   "distributor" in the Data Standard view?
-- How to document that CAPS liveness concerns the step on the ledger, not
-  data production, without promising more than the model gives.

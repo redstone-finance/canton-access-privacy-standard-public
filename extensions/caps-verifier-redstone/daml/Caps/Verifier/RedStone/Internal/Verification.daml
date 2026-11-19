@@ -6,7 +6,8 @@
 -- RedStone SDK reports: a payload it cannot parse, packages outside the
 -- fixing time, a configuration it does not accept.
 module Caps.Verifier.RedStone.Internal.Verification
-  ( verifyContent
+  ( Scheme(..)
+  , verifyContent
   , verifyRound
   , verifyFreshness
   , commitment
@@ -14,27 +15,38 @@ module Caps.Verifier.RedStone.Internal.Verification
   ) where
 
 import DA.Crypto.Text (fromHex, isHex, keccak256, secp256k1WithEcdsaOnly, toHex)
+import DA.Date (Month(Jan), date)
 import DA.List (chunksOf, sort)
 import DA.Numeric (cast)
 import DA.Optional (fromSomeNote, isNone, isSome)
 import qualified DA.Text as T
 import qualified DA.TextMap as TM
-import DA.Time (RelTime, addRelTime)
+import DA.Time (RelTime, addRelTime, convertRelTimeToMicroseconds, subTime, time)
 
 import qualified Caps.Api.CoreV1 as Api
+import Caps.Verifier.RedStone.Internal.Der (derPublicKey, isDerSignature)
 import DataStandard.Utils (AnyValue(..))
 import RedStone.Config (BaseConfig(..), config)
 import RedStone.Error (ErrorCode(..), RedStoneError(..))
 import RedStone.Processor (processPayloadNumeric)
 import RedStone.Result (Result(..))
 
+-- | What a content is verified against: the verifier's fields that the
+-- authenticity check uses.
+data Scheme = Scheme with
+  signers : [Text]
+  signerCountThreshold : Int
+  feedIds : [Text]
+  schemaVersion : Text
+
 -- | Authenticity: `Verified` with the round commitment when the data point
--- carries exactly `feedIds` and the payload's packages, signed by at least
--- `signerCountThreshold` of `signers`, aggregate to exactly its values at
--- its fixing time; `Rejected` with every failed check otherwise.
-verifyContent : [Text] -> Int -> [Text] -> Api.CapsuleContent -> Update Api.VerificationResult
-verifyContent signers signerCountThreshold feedIds content =
-  pure $ case (check signers signerCountThreshold feedIds content, commitment content) of
+-- carries exactly the scheme's `feedIds` under its `schemaVersion`, and the
+-- payload's packages, signed by at least `signerCountThreshold` of
+-- `signers`, aggregate to exactly its values at its fixing time; `Rejected`
+-- with every failed check otherwise.
+verifyContent : Scheme -> Api.CapsuleContent -> Update Api.VerificationResult
+verifyContent scheme content =
+  pure $ case (check scheme content, commitment content) of
     ([], Some dataHash) -> Api.Verified dataHash
     ([], None) -> Api.Rejected [notRedStonePayload]
     (failed, _) -> Api.Rejected failed
@@ -66,18 +78,10 @@ attestationChecks keys round =
     signatureChecks = case round.attestation of
       None -> [("round carries no attestation", False)]
       Some signature
-        | not (isDerEncoded signature) -> [("round attestation is not a DER signature", False)]
+        | not (isDerSignature signature) -> [("round attestation is not a DER signature", False)]
         | otherwise ->
             [ ("round attestation matches no key", any (secp256k1WithEcdsaOnly signature message) ks)
             | Some ks <- [derKeys] ]
-
--- | Whether `hex` has the DER envelope `DA.Crypto.Text` requires of a
--- signature and a key, whose builtins abort on anything else: hex bytes, the
--- SEQUENCE tag and a one-byte length covering the rest.
-isDerEncoded : Text -> Bool
-isDerEncoded hex =
-  isHex hex && T.length hex >= 4 && T.take 2 hex == "30"
-    && fmap (\n -> 2 * (2 + n)) (fromHex (T.substring 2 2 hex)) == Some (T.length hex)
 
 -- | What the key holder signs to attest a round, as the nodes sign packages:
 -- the keccak256 of `caps-round-attestation-v1|roundNumber|dataHash`. The
@@ -116,10 +120,10 @@ commitment content = case content.payload of
   _ -> None
 
 -- | Every check that fails, in order; empty when the content is authentic.
-check : [Text] -> Int -> [Text] -> Api.CapsuleContent -> [Api.RejectionReason]
-check signers signerCountThreshold feedIds content = case content.payload of
+check : Scheme -> Api.CapsuleContent -> [Api.RejectionReason]
+check scheme content = unsigned <> fractional <> case content.payload of
   AVText payloadHex
-    | map fst feeds /= sort feedIds -> ["data point feeds differ from the verifier's"]
+    | map fst feeds /= sort scheme.feedIds -> ["data point feeds differ from the verifier's"]
     | otherwise -> case mapA decimalValue feeds of
         Left reason -> [reason]
         Right expected -> case aggregate expected payloadHex of
@@ -131,10 +135,22 @@ check signers signerCountThreshold feedIds content = case content.payload of
     dataPoint = content.dataPoint
     feeds = TM.toList dataPoint.values
 
+    -- The schema version is in no package, so it is the verifier's.
+    unsigned =
+      [ "data point schema version differs from the verifier's"
+      | dataPoint.schemaVersion /= scheme.schemaVersion ]
+
+    -- The packages carry milliseconds, and the SDK compares in them: a
+    -- fixing time between two would let one payload stand for every fixing
+    -- time of its millisecond, each a later round to the head.
+    fractional =
+      [ "fixing time is not a whole millisecond"
+      | not $ isWholeMillisecond dataPoint.publishedAt ]
+
     -- The SDK's per-feed aggregates, in the data point's feed order. The
     -- window is zero, so the packages carry exactly the fixing time.
     aggregate expected payloadHex =
-      case config (baseConfig signers signerCountThreshold) (map (feedIdBytes . fst) expected) dataPoint.publishedAt of
+      case config (baseConfig scheme.signers scheme.signerCountThreshold) (map (feedIdBytes . fst) expected) dataPoint.publishedAt of
         Error e -> Error e
         Ok cfg -> case processPayloadNumeric cfg payloadHex of
           Error e -> Error e
@@ -151,6 +167,13 @@ check signers signerCountThreshold feedIds content = case content.payload of
 
 notRedStonePayload : Api.RejectionReason
 notRedStonePayload = "payload must be the hex text of a RedStone payload"
+
+-- | Whether `t` falls on a millisecond, the resolution of a package
+-- timestamp.
+isWholeMillisecond : Time -> Bool
+isWholeMillisecond t = convertRelTimeToMicroseconds (subTime t epoch) % 1000 == 0
+  where
+    epoch = time (date 1970 Jan 1) 0 0 0
 
 -- | A failure the SDK reports, as a reason: its kind from the code and its
 -- message. The shown argument is left out, it can be the whole payload.
@@ -178,18 +201,3 @@ feedIdBytes : Text -> [Int]
 feedIdBytes feedId = map (byte . T.implode) $ chunksOf 2 $ T.explode $ toHex feedId
   where
     byte pair = fromSomeNote ("bad hex byte " <> pair) $ fromHex pair
-
--- | A key in the format of `signers` as `DA.Crypto.Text` takes it, DER
--- (SPKI): one with the SPKI header and the length of one is DER already, one
--- of 65 bytes with the 04 prefix or the 64-byte X||Y gets the header; None
--- for anything else.
-derPublicKey : Text -> Optional Text
-derPublicKey key
-  | not (isHex hex) = None
-  | spkiHeader `T.isPrefixOf` hex && T.length hex == T.length spkiHeader + 130 = Some hex
-  | "04" `T.isPrefixOf` hex && T.length hex == 130 = Some $ spkiHeader <> hex
-  | T.length hex == 128 = Some $ spkiHeader <> "04" <> hex
-  | otherwise = None
-  where
-    hex = T.asciiToLower key
-    spkiHeader = "3056301006072a8648ce3d020106052b8104000a034200"

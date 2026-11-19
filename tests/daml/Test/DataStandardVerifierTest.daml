@@ -12,17 +12,18 @@ import DA.Date (Month(Oct), date)
 import DA.Foldable (forA_)
 import qualified DA.Text as T
 import qualified DA.TextMap as TM
-import DA.Time (addRelTime, hours, minutes, seconds, time)
+import DA.Time (addRelTime, hours, microseconds, milliseconds, minutes, seconds, time)
 import Daml.Script
 
 import qualified Caps.Api.CoreV1 as Api
 import Caps.Core.DataDefinition
 import Caps.Core.License (License(..))
+import Caps.Test.Fixtures.Signatures (malformedDerSignatures)
 import Caps.Verifier.DataStandard
 import Caps.Verifier.DataStandard.Internal.Verification (attestationMessage, envelope)
 import DataStandard.Codecs.Envelope (hashSignedDataPoint)
 import DataStandard.DataPointV1 (PublishedDataPointView(..))
-import DataStandard.Utils (AnyValue(..), emptyMetadata)
+import DataStandard.Utils (AnyValue(..), Metadata(..), emptyMetadata)
 
 -- Fixture -------------------------------------------------------------------
 
@@ -75,7 +76,7 @@ setup = do
 
   proposal <- submit operator $ createCmd DefinitionProposal with
     dataId = "BTC,ETH", operator, auditors = [auditor], readers = [reader, licensee], verifier
-    publishers = None, accepted = []
+    headObservers = [licensee], publishers = None, accepted = []
   accepted <- submit auditor $ exerciseCmd proposal DefinitionProposal_Accept with auditor
   (definitionCid, headCid) <- submit operator $ exerciseCmd accepted DefinitionProposal_Finalize
   let definition = toInterfaceContractId @Api.DataDefinition definitionCid
@@ -106,9 +107,14 @@ signedContent feed dp expiry signers = do
   signatures <- forA signers $ \key -> secp256k1sign key.privateKey rootHash
   pure unsigned with payload = payload expiry signatures
 
+-- | The fixture's data point signed by all three keys, with `expiry` as the
+-- signed replay bound.
+contentUntil feed expiry =
+  signedContent feed (dataPoint feed.operator fixingTime medianValues) expiry feed.keys
+
 -- | The canonical content: the fixture's data point signed by all three keys.
 content : Feed -> Script Api.CapsuleContent
-content feed = signedContent feed (dataPoint feed.operator fixingTime medianValues) expiresAt feed.keys
+content feed = contentUntil feed expiresAt
 
 -- | The commitment the verifier reports for `content`.
 expectedDataHash : Feed -> Api.CapsuleContent -> Text
@@ -155,6 +161,10 @@ verifyRoundWith feed attestationKeys c round = do
   submit feed.client $ exerciseCmd (toInterfaceContractId @Api.Verifier own) Api.Verifier_VerifyRound with
     actor = feed.client, capsule = capsule feed c, round
 
+verifyFreshnessAt feed verifier c asOf =
+  submit feed.client $ exerciseCmd verifier Api.Verifier_VerifyFreshness with
+    actor = feed.client, capsule = capsule feed c, asOf
+
 -- Verifier ------------------------------------------------------------------
 
 testVerifiesFullQuorum : Script ()
@@ -189,6 +199,21 @@ testRejectsForeignSignature = do
   c <- signedContent feed (dataPoint feed.operator fixingTime medianValues) expiresAt (take 1 feed.keys ++ [foreign])
   (_, result) <- verifyAsClient feed c
   result === Api.Rejected ["signature 2 matches no signer", "signer quorum not reached: 1 of 2"]
+
+-- | A signature in the payload that is not a DER signature matches no signer
+-- instead of aborting the check: not hex, empty, a bare tag, a DER envelope
+-- around anything but two scalars.
+testRejectsMalformedSignature : Script ()
+testRejectsMalformedSignature = do
+  feed <- setup
+  c <- content feed
+  let withSignature extra = case c.payload of
+        AVMap fields | Some (AVList signed) <- TM.lookup "signatures" fields ->
+          c with payload = AVMap $ TM.insert "signatures" (AVList $ signed <> [AVText extra]) fields
+        _ -> c
+  forA_ (["zz", "", "30"] <> malformedDerSignatures) $ \malformed -> do
+    (_, result) <- verifyAsClient feed $ withSignature malformed
+    result === Api.Rejected ["signature 4 matches no signer"]
 
 testRejectsDuplicateSigner : Script ()
 testRejectsDuplicateSigner = do
@@ -229,6 +254,18 @@ testRejectsWrongSchema = do
   case result of
     Api.Rejected (_ :: _) -> pure ()
     other -> fail $ "expected a rejection, got " <> show other
+
+-- | The envelope carries no metadata and the verifier does not fix it: the
+-- capsule signatory's annotation, which the check passes over.
+testMetadataIsNotVerified : Script ()
+testMetadataIsNotVerified = do
+  feed <- setup
+  c <- content feed
+  let annotated = c with
+        dataPoint = c.dataPoint with
+          metadata = Metadata with values = TM.fromList [("example.com/source", "venue")]
+  (_, result) <- verifyAsClient feed annotated
+  result === Api.Verified (expectedDataHash feed c)
 
 testRejectsPublishedAfterExpiry : Script ()
 testRejectsPublishedAfterExpiry = do
@@ -288,17 +325,18 @@ testRejectsUnattestedRound = do
   replayed <- check other.attestation
   replayed === Api.Failed ["round attestation matches no key"]
 
--- | An attestation that is not a DER signature, or a key that is not a DER
--- public key, fails the check instead of aborting it; a DER envelope around
--- no valid signature matches no key. A bad key on an unattested round gets
--- both reasons.
+-- | An attestation that is not a DER signature, a DER envelope around
+-- anything but two scalars among them, or a key that is not a DER public
+-- key, fails the check instead of aborting it; two scalars that are no valid
+-- signature match no key. A bad key on an unattested round gets both
+-- reasons.
 testRejectsMalformedAttestation : Script ()
 testRejectsMalformedAttestation = do
   feed <- setup
   c <- content feed
   let round = capsuleRound feed c
       check keys signature = verifyRoundWith feed keys c round with attestation = Some signature
-  forA_ ["zz", "30", "3006020100"] $ \signature -> do
+  forA_ (["zz", "30", "3006020100"] <> malformedDerSignatures) $ \signature -> do
     result <- check [feed.attester.publicKey] signature
     result === Api.Failed ["round attestation is not a DER signature"]
   empty <- check [feed.attester.publicKey] "3006020100020100"
@@ -322,6 +360,41 @@ testRejectsAttestationWithoutKeys = do
   attested <- verifyRoundWith feed [] c round
   attested === Api.Failed ["round carries an attestation but the verifier names no keys"]
 
+-- | The envelope is hashed at millisecond resolution, so a fixing time
+-- inside its millisecond would carry the same signatures as a later round.
+testRejectsFractionalFixingTime : Script ()
+testRejectsFractionalFixingTime = do
+  feed <- setup
+  c <- content feed
+  forA_ [1, 999] $ \micros -> do
+    let later = c with
+          dataPoint = c.dataPoint with
+            publishedAt = addRelTime fixingTime $ microseconds micros
+    (_, result) <- verifyAsClient feed later
+    result === Api.Rejected ["fixing time is not a whole millisecond"]
+
+testRejectsRoundOfAnotherDefinition : Script ()
+testRejectsRoundOfAnotherDefinition = do
+  feed <- setup
+  c <- content feed
+  (ownVerifier, _) <- verifyAsClient feed c
+  -- The other definition has a canonical verifier, and an attestation key,
+  -- of its own.
+  otherAttester <- secp256k1generatekeypair
+  otherVerifier <- submit feed.operator $ createCmd DataStandardVerifier with
+    owner = feed.operator, observers = []
+    signers = map (.publicKey) feed.keys, signerCountThreshold = 2
+    attestationKeys = [otherAttester.publicKey]
+    maxBehind = hours 1, maxAhead = minutes 5
+  proposal <- submit feed.operator $ createCmd DefinitionProposal with
+    dataId = "SOL", operator = feed.operator, auditors = [], readers = [], headObservers = []
+    verifier = toInterfaceContractId otherVerifier, publishers = None, accepted = []
+  (otherDefinition, _) <- submit feed.operator $ exerciseCmd proposal DefinitionProposal_Finalize
+  round <- attest feed (capsuleRound feed c) with definition = toInterfaceContractId otherDefinition
+  result <- submit feed.client $ exerciseCmd ownVerifier Api.Verifier_VerifyRound with
+    actor = feed.client, capsule = capsule feed c, round
+  result === Api.Failed ["round belongs to another definition"]
+
 testFreshness : Script ()
 testFreshness = do
   feed <- setup
@@ -338,6 +411,36 @@ testFreshness = do
   stale === Api.Failed ["fixing time too far in the past", "payload expired"]
   early <- freshnessAt $ addRelTime fixingTime (negate (minutes 10))
   early === Api.Failed ["fixing time too far in the future"]
+
+-- | The window and the signed replay bound are inclusive. The window's
+-- edges are judged on content that expires past them, so that the window
+-- alone decides.
+testFreshnessAcceptsWindowEdges : Script ()
+testFreshnessAcceptsWindowEdges = do
+  feed <- setup
+  c <- contentUntil feed $ addRelTime fixingTime $ hours 2
+  (ownVerifier, _) <- verifyAsClient feed c
+  forA_ [addRelTime fixingTime (hours 1), addRelTime fixingTime (negate (minutes 5))] $ \asOf -> do
+    result <- verifyFreshnessAt feed ownVerifier c asOf
+    result === Api.Passed
+  expiring <- content feed
+  atExpiry <- verifyFreshnessAt feed ownVerifier expiring expiresAt
+  atExpiry === Api.Passed
+
+testFreshnessRejectsBeyondWindowEdges : Script ()
+testFreshnessRejectsBeyondWindowEdges = do
+  feed <- setup
+  c <- contentUntil feed $ addRelTime fixingTime $ hours 2
+  (ownVerifier, _) <- verifyAsClient feed c
+  forA_
+    [ (addRelTime fixingTime (hours 1 + milliseconds 1), "fixing time too far in the past")
+    , (addRelTime fixingTime (negate (minutes 5 + milliseconds 1)), "fixing time too far in the future")
+    ] $ \(asOf, rejection) -> do
+      result <- verifyFreshnessAt feed ownVerifier c asOf
+      result === Api.Failed [rejection]
+  expiring <- content feed
+  pastExpiry <- verifyFreshnessAt feed ownVerifier expiring $ addRelTime expiresAt $ milliseconds 1
+  pastExpiry === Api.Failed ["payload expired"]
 
 -- Data path -----------------------------------------------------------------
 

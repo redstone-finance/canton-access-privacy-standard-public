@@ -12,14 +12,15 @@ module Caps.Verifier.DataStandard.Internal.Verification
   , attestationMessage
   ) where
 
-import DA.Crypto.Text (fromHex, isHex, secp256k1, toHex)
+import DA.Crypto.Text (secp256k1, toHex)
+import DA.Date (Month(Jan), date)
 import DA.List (dedup, findIndex)
 import DA.Optional (catOptionals, isNone)
-import qualified DA.Text as T
 import qualified DA.TextMap as TM
-import DA.Time (RelTime, addRelTime)
+import DA.Time (RelTime, addRelTime, convertRelTimeToMicroseconds, subTime, time)
 
 import qualified Caps.Api.CoreV1 as Api
+import Caps.Verifier.DataStandard.Internal.Der (isDerEncoded, isDerSignature)
 import DataStandard.Codecs.Envelope (hashSignedDataPoint)
 import DataStandard.Codecs.Verify (verifyDataPointWith)
 import DataStandard.Utils (AnyValue(..), SignedDataPoint(..))
@@ -32,15 +33,21 @@ verifyContent : [Text] -> Int -> Api.CapsuleContent -> Api.VerificationResult
 verifyContent signers signerCountThreshold content = case payload content of
   Left reason -> Api.Rejected [reason]
   Right (expiresAt, signatures)
+    | not $ isWholeMillisecond signed.publishedAt ->
+        Api.Rejected ["fixing time is not a whole millisecond"]
     | signed.publishedAt > expiresAt -> Api.Rejected ["published after expiry"]
     | null failed -> Api.Verified (hashSignedDataPoint signed).value
     | otherwise -> Api.Rejected failed
     where
       signed = envelope content expiresAt
       -- Checked at the fixing time itself, so that only the signature is
-      -- judged and never the payload's age: that is `verifyFreshness`.
-      verifies signature key = either (const False) (const True) $
-        verifyDataPointWith content.dataPoint.distributor key signed.publishedAt signed signature
+      -- judged and never the payload's age: that is `verifyFreshness`. A
+      -- text that is no DER signature matches no signer: the library would
+      -- abort on it.
+      verifies signature key
+        | isDerSignature signature = either (const False) (const True) $
+            verifyDataPointWith content.dataPoint.distributor key signed.publishedAt signed signature
+        | otherwise = False
       matched = [ findIndex (verifies signature) signers | signature <- signatures ]
       distinct = dedup $ catOptionals matched
       failed =
@@ -48,6 +55,14 @@ verifyContent signers signerCountThreshold content = case payload content of
         | (i, None) <- zip [1..length signatures] matched ]
         <> [ "signer quorum not reached: " <> show (length distinct) <> " of " <> show signerCountThreshold
            | length distinct < signerCountThreshold ]
+
+-- | Whether `t` falls on a millisecond, the resolution the envelope is
+-- hashed at: a fixing time between two would let one signed envelope stand
+-- for every fixing time of its millisecond.
+isWholeMillisecond : Time -> Bool
+isWholeMillisecond t = convertRelTimeToMicroseconds (subTime t epoch) % 1000 == 0
+  where
+    epoch = time (date 1970 Jan 1) 0 0 0
 
 -- | Canonicality: the round is this capsule's, at its fixing time, commits
 -- to its content and, where `attestationKeys` names any, carries a
@@ -76,18 +91,10 @@ attestationChecks keys round =
     signatureChecks = case round.attestation of
       None -> [("round carries no attestation", False)]
       Some signature
-        | not (isDerEncoded signature) -> [("round attestation is not a DER signature", False)]
+        | not (isDerSignature signature) -> [("round attestation is not a DER signature", False)]
         | otherwise ->
             [ ("round attestation matches no key", any (secp256k1 signature message) keys)
             | derKeys ]
-
--- | Whether `hex` has the DER envelope `DA.Crypto.Text` requires of a
--- signature and a key, whose builtins abort on anything else: hex bytes, the
--- SEQUENCE tag and a one-byte length covering the rest.
-isDerEncoded : Text -> Bool
-isDerEncoded hex =
-  isHex hex && T.length hex >= 4 && T.take 2 hex == "30"
-    && fmap (\n -> 2 * (2 + n)) (fromHex (T.substring 2 2 hex)) == Some (T.length hex)
 
 -- | What the key holder signs to attest a round, hex-encoded:
 -- `caps-round-attestation-v1|roundNumber|dataHash`. The fixing time is not

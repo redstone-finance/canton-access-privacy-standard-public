@@ -1,0 +1,23 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Signature vectors the verifier tests share.
+module Caps.Test.Fixtures.Signatures where
+
+-- | Hex texts with the DER envelope of a signature around anything but two
+-- signature scalars. `DA.Crypto.Text` aborts on each, so a verifier has to
+-- turn them away before it calls a builtin.
+malformedDerSignatures : [Text]
+malformedDerSignatures =
+  [ "3004ffffffff" -- no integer inside
+  , "3006020100030100" -- the second element is not an integer
+  , "30080201000201000000" -- bytes after the second integer
+  , "300402000200" -- empty integers
+  , "30060201ff0201ff" -- negative integers
+  , "30080202000102020001" -- redundant leading zero bytes
+  , "3006020100020500" -- the second integer runs past the envelope
+  , "3003020100" -- one integer
+  , "3009020100020100020100" -- three integers
+  -- The first integer is the order of secp256k1.
+  , "3026022100fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141020101"
+  ]

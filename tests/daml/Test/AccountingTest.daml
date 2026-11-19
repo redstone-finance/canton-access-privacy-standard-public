@@ -69,7 +69,7 @@ setup = do
     maxBehind = hours 1, maxAhead = minutes 5
   let bootstrap dataId = do
         proposal <- submit operator $ createCmd DefinitionProposal with
-          dataId, operator, auditors = [auditor], readers = []
+          dataId, operator, auditors = [auditor], readers = [], headObservers = []
           verifier = toInterfaceContractId verifierCid, publishers = None, accepted = []
         accepted <- submit auditor $ exerciseCmd proposal DefinitionProposal_Accept with auditor
         (definitionCid, headCid) <- submit operator $ exerciseCmd accepted DefinitionProposal_Finalize
@@ -413,6 +413,42 @@ testCreditLicenseCountsDownAndKeepsItsOrigin = do
   markers <- markersOf feed.accountant
   map (.license) markers === [sub, sub]
   map (.weight) markers === [prepaid_distribution_weight, prepaid_distribution_weight]
+
+-- | A consumable or credit license is consumed on every distribution, and
+-- an observer of a consumed contract is informed of the exercise, so nobody
+-- observes one. The operator and the licensor see the license as issued
+-- through its grant, which a distribution fetches and leaves as it is.
+testPrepaidLicenseIsSeenThroughItsGrant : Script ()
+testPrepaidLicenseIsSeenThroughItsGrant = do
+  feed <- setup
+  (sub, root) <- licenseeSetup feed
+  credit <- sublicense feed.consumer sub (Some twoCredits) []
+  [(grantCid, grant)] <- query @LicenseGrant feed.operator
+  grants <- forA [feed.operator, feed.licensee] $ \party -> query @LicenseGrant party
+  grants === [[(grantCid, grant)], [(grantCid, grant)]]
+  (grant.owner, grant.licensor, grant.operator, grant.terms)
+    === (feed.consumer, feed.licensee, feed.operator, twoCredits)
+  seen <- forA [feed.operator, feed.licensee] $ \party -> query @CreditLicense party
+  seen === [[], []]
+  [(_, license)] <- query @CreditLicense feed.consumer
+  license.grant === grantCid
+  _ <- submit feed.consumer $ distribute credit (Api.ByView root) [feed.client]
+  after <- forA [feed.operator, feed.licensee] $ \party -> query @LicenseGrant party
+  after === grants
+  stillUnseen <- forA [feed.operator, feed.licensee] $ \party -> query @CreditLicense party
+  stillUnseen === [[], []]
+
+testRevokedGrantStopsDistribution : Script ()
+testRevokedGrantStopsDistribution = do
+  feed <- setup
+  (sub, root) <- licenseeSetup feed
+  credit <- sublicense feed.consumer sub (Some twoCredits) []
+  [(grantCid, _)] <- query @LicenseGrant feed.licensee
+  -- A client of the owner neither sees the grant nor may revoke it; the
+  -- licensor may, and the license distributes no more.
+  submitMustFail feed.client $ exerciseCmd grantCid LicenseGrant_Revoke with revoker = feed.client
+  submit feed.licensee $ exerciseCmd grantCid LicenseGrant_Revoke with revoker = feed.licensee
+  submitMustFail feed.consumer $ distribute credit (Api.ByView root) [feed.client]
 
 testPrepaidLicensesCannotBeSublicensed : Script ()
 testPrepaidLicensesCannotBeSublicensed = do

@@ -9,16 +9,17 @@
 -- distributing capsules scoped to their own clients; the publisher of the
 -- rounds is a stakeholder of none of them. A consumer proves what it received
 -- by two local checks: authenticity, against a verifier it instantiated
--- itself, and canonicality, against the round it read from its own
--- participant. Where the feed's verifier names attestation keys, a round
--- also carries an attestation by them over the round, so that
+-- itself, and canonicality, against the round it read from a participant
+-- hosting the reader. Where the feed's verifier names attestation keys, a
+-- round also carries an attestation by them over the round, so that
 -- `Verifier_VerifyRound` holds on the view alone, for a party that cannot
 -- read the round.
 --
 -- This package holds views, data types and choices whose bodies are single
--- method calls. A package that defines an interface can never be
--- smart-contract-upgraded, so no logic lives here: it belongs to the
--- implementing templates or to the standard's utility package.
+-- method calls; `Round_Fetch` alone checks the round's signatories and
+-- returns its view. A package that defines an interface can never be
+-- smart-contract-upgraded, so no other logic lives here: it belongs to the
+-- packages that implement the interfaces.
 --
 -- Two rules shape every signature below. First, verification takes views,
 -- never contract ids, because a fetch informs the fetched contract's
@@ -27,6 +28,8 @@
 -- Verifier: the data path is generic, and an oracle joins the standard by
 -- implementing that one interface.
 module Caps.Api.CoreV1 where
+
+import DA.List (dedupSort)
 
 import DataStandard.DataPointV1 (PublishedDataPoint, PublishedDataPointView)
 import DataStandard.Utils (AnyValue)
@@ -148,8 +151,9 @@ interface Verifier where
       capsule : CapsuleView
         -- ^ The capsule being checked.
       round : RoundView
-        -- ^ The round as read from the consumer's own participant or, for a
-        -- consumer that cannot read it, as handed over next to the capsule.
+        -- ^ The round's view: read from a participant hosting the reader
+        -- or, for a consumer that cannot read it, handed over next to the
+        -- capsule.
     controller actor
     do verifier_verifyRoundImpl this self arg
 
@@ -250,9 +254,10 @@ data CreateRoundResult = CreateRoundResult with
 -- ---------------------------------------------------------------------------
 
 -- | The immutable, price-free record of one fixing, visible to the feed's
--- readers party. A consumer reads it from its own participant and passes the
--- view to `Verifier_VerifyRound`; it is never fetched inside a consumer's
--- transaction.
+-- readers party. A consumer reads it from a participant hosting that party
+-- and passes the view to `Verifier_VerifyRound`; verification never fetches
+-- it. A transaction that must rest on the ledger's own round takes the view
+-- through `Round_Fetch`.
 interface Round where
   viewtype RoundView
 
@@ -270,6 +275,25 @@ interface Round where
         -- ^ The party retiring the round; sole controller.
     controller actor
     do round_archiveImpl this self arg
+
+  -- | Return this round's view inside a transaction, to a caller that names
+  -- the round's signatories. Open to any party that can see the round, by
+  -- observation or by explicit disclosure, and to no implementation's
+  -- discretion: it has no method. The round's signatories confirm the
+  -- exercise and learn of it; its observers do not.
+  nonconsuming choice Round_Fetch : RoundView
+    with
+      actor : Party
+        -- ^ The party fetching the round; sole controller.
+      signatories : [Party]
+        -- ^ The parties that sign the feed's rounds. The choice fails unless
+        -- they are exactly the round's signatories, so that a caller cannot
+        -- name fewer than sign the chain.
+    controller actor
+    do
+      assertMsg "round is not signed by the named signatories" $
+        dedupSort (signatory this) == dedupSort signatories
+      pure $ view this
 
 -- | View for `Round`.
 data RoundView = RoundView with

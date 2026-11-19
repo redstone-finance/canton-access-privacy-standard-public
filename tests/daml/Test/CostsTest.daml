@@ -1,0 +1,250 @@
+-- Copyright (c) 2026 RedStone. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | The contracts each role gains with a publication, and what retention
+-- leaves, measured on the reference implementation: two distributors with
+-- three clients each. The numbers are the ones `docs/costs.md` states; a
+-- change that moves one fails here.
+module Test.CostsTest where
+
+import DA.Action (foldlA, void)
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.List (last, sortOn)
+import qualified DA.TextMap as TM
+import DA.Time (hours, minutes)
+import Daml.Script
+
+import qualified Caps.Api.CoreV1 as Api
+import Caps.Accounting.AccountingDelegate
+import Caps.Accounting.DistributionMarker
+import Caps.CapsuleArchiver
+import Caps.Core.DataDefinition
+import Caps.ExtendedLicensing.License
+import Caps.RoundArchiver
+import Caps.Test.Fixtures.TestVerifier
+import DataStandard.DataPointV1 (PublishedDataPointView(..))
+import DataStandard.Utils (AnyValue(..), emptyMetadata)
+
+-- Fixture -------------------------------------------------------------------
+
+data Feed = Feed with
+    operator : Party
+    auditor : Party
+    reader : Party
+      -- ^ The readers party.
+    accountant : Party
+    distributors : [Distributor]
+    definition : ContractId Api.DataDefinition
+    head : ContractId Api.RoundHead
+    rootLicense : ContractId Api.License
+
+-- | A licensee of the root license, its clients and the sublicense it
+-- distributes under.
+data Distributor = Distributor with
+    party : Party
+    clients : [Party]
+    license : ContractId Api.License
+
+-- | How a distributor hands a round to its clients.
+data Distribution
+  = PerClient
+    -- ^ One capsule to each client, so that no client sees another.
+  | PerGroup
+    -- ^ One capsule to all its clients.
+  | NoDistribution
+
+nodesTag : Text
+nodesTag = "signed-by-nodes"
+
+-- | A feed with a readers party, two distributors that observe the head and
+-- three clients of each; the root license names an accounting delegate when
+-- `accounting` is set.
+setup : Bool -> Script Feed
+setup accounting = do
+  operator <- allocateParty "Operator"
+  auditor <- allocateParty "Auditor"
+  reader <- allocateParty "Reader"
+  accountant <- allocateParty "Accountant"
+  licensees <- mapA allocateParty ["Licensee1", "Licensee2"]
+  clients <- forA licensees $ const $ mapA allocateParty ["Client1", "Client2", "Client3"]
+
+  verifierCid <- submit operator $ createCmd TestVerifier with
+    owner = operator, acceptedTag = nodesTag, observers = [reader]
+    attestationKeys = []
+    maxBehind = hours 1, maxAhead = minutes 5
+  proposal <- submit operator $ createCmd DefinitionProposal with
+    dataId = "BTC/USD", operator, auditors = [auditor], readers = [reader]
+    headObservers = licensees
+    verifier = toInterfaceContractId verifierCid, publishers = None, accepted = []
+  accepted <- submit auditor $ exerciseCmd proposal DefinitionProposal_Accept with auditor
+  (definitionCid, headCid) <- submit operator $ exerciseCmd accepted DefinitionProposal_Finalize
+  let definition = toInterfaceContractId @Api.DataDefinition definitionCid
+  delegate <-
+    if accounting
+      then fmap (Some . toInterfaceContractId) $ submit operator $ createCmd AccountingDelegate with
+        owner = operator, accountants = [accountant], licensees, definition
+      else pure None
+  rootLicense <- fmap (toInterfaceContractId @Api.License) $ submit operator $ createCmd OpenLicense with
+    definition, owner = operator, licensor = operator, operator
+    licensees, validUntil = None, delegate
+  distributors <- forA (zip licensees clients) $ \(party, ownClients) -> do
+    license <- submit party $ exerciseCmd rootLicense Api.License_CreateSublicense with
+      actor = party, licenseType = AVText "open", licensees = ownClients
+    pure Distributor with party, clients = ownClients, license
+  pure Feed with
+    operator, auditor, reader, accountant, distributors, definition, rootLicense
+    head = toInterfaceContractId headCid
+
+-- | Publish `count` rounds a minute apart, each distributed as
+-- `distribution` says, and return the feed at its new head.
+publish : Distribution -> Int -> Feed -> Script Feed
+publish distribution count feed = foldlA (\f _ -> publishOne distribution f) feed [1 .. count]
+
+publishOne : Distribution -> Feed -> Script Feed
+publishOne distribution feed = do
+  passTime (minutes 1)
+  now <- getTime
+  result <- submit feed.operator $ exerciseCmd feed.head Api.RoundHead_CreateRound with
+    actor = feed.operator
+    attestation = None
+    content = Api.CapsuleContent with
+      dataPoint = PublishedDataPointView with
+        distributor = feed.operator, publishedAt = now, schemaVersion = "quote-1"
+        values = TM.fromList [("price", AVDecimal 50000.0)], metadata = emptyMetadata
+      payload = AVText nodesTag
+      license = feed.rootLicense
+  forA_ feed.distributors $ \d -> do
+    Some root <- queryInterfaceContractId d.party result.capsule
+    let send clients = void $ submit d.party $ exerciseCmd d.license Api.License_Distribute with
+          source = Api.ByView root, clients
+    case distribution of
+      PerClient -> forA_ d.clients $ \client -> send [client]
+      PerGroup -> send d.clients
+      NoDistribution -> pure ()
+  pure feed with head = result.head
+
+-- | The active contracts `party` holds of every kind a publication or a
+-- distribution creates.
+held : Party -> Script Int
+held party = do
+  heads <- length <$> queryInterface @Api.RoundHead party
+  rounds <- length <$> queryInterface @Api.Round party
+  capsules <- length <$> queryInterface @Api.Capsule party
+  licenses <- length <$> queryInterface @Api.License party
+  delegates <- length <$> queryInterface @Api.LicenseDelegate party
+  markers <- length <$> query @DistributionMarker party
+  pure $ heads + rounds + capsules + licenses + delegates + markers
+
+-- | The roles measured, one party of each: operator, auditor, readers
+-- party, a distributor, one of its clients, accountant.
+roles : Feed -> [Party]
+roles feed =
+  let d :: _ = feed.distributors
+      client :: _ = d.clients
+  in [feed.operator, feed.auditor, feed.reader, d.party, client, feed.accountant]
+
+-- | What each of `roles` gains over `count` rounds.
+gainOver : Distribution -> Int -> Feed -> Script [Int]
+gainOver distribution count feed = do
+  before <- mapA held $ roles feed
+  _ <- publish distribution count feed
+  now <- mapA held $ roles feed
+  pure [b - a | (a, b) <- zip before now]
+
+-- | The rounds each measurement publishes.
+measuredRounds : Int
+measuredRounds = 5
+
+-- | What `roles` gain over `measuredRounds` rounds when they gain `each`
+-- per round.
+perRound : [Int] -> [Int]
+perRound each = map (* measuredRounds) each
+
+-- Per publication -----------------------------------------------------------
+
+-- A publication is a round and a root capsule: both for the operator and
+-- each auditor, the round for the readers party, the capsule for each root
+-- licensee.
+testPublicationAlone : Script ()
+testPublicationAlone = do
+  feed <- setup True
+  gain <- gainOver NoDistribution measuredRounds feed
+  gain === perRound [2, 2, 1, 1, 0, 0]
+
+-- One capsule and one marker per client: a distributor with C clients gains
+-- 1 + 2C, the accountant C per distributor, and nobody on the publication
+-- path anything.
+testDistributionPerClient : Script ()
+testDistributionPerClient = do
+  feed <- setup True
+  gain <- gainOver PerClient measuredRounds feed
+  gain === perRound [2, 2, 1, 7, 1, 6]
+
+-- One capsule to all the clients: 1 + 2 whatever their number, and one
+-- marker per distributor for the accountant.
+testDistributionPerGroup : Script ()
+testDistributionPerGroup = do
+  feed <- setup True
+  gain <- gainOver PerGroup measuredRounds feed
+  gain === perRound [2, 2, 1, 3, 1, 2]
+
+-- Without the accounting delegate a distribution is the capsule alone.
+testDistributionWithoutAccounting : Script ()
+testDistributionWithoutAccounting = do
+  feed <- setup False
+  gain <- gainOver PerClient measuredRounds feed
+  gain === perRound [2, 2, 1, 4, 1, 0]
+
+-- Retention ------------------------------------------------------------------
+
+keptRoundCount : Int
+keptRoundCount = 2
+
+-- | Run the operator's round archiver and every distributor's capsule
+-- archiver over everything each of them holds.
+archiveAll : Feed -> ContractId RoundArchiver -> [(Party, ContractId CapsuleArchiver)] -> Script ()
+archiveAll feed roundArchiver capsuleArchivers = do
+  forA_ capsuleArchivers $ \(party, archiver) -> do
+    capsules <- queryInterface @Api.Capsule party
+    -- The party's own capsules, oldest round first; the last names the
+    -- current round.
+    let own = sortOn (\(_, view) -> view.roundNumber)
+          [(cid, view) | (cid, Some view) <- capsules, view.content.dataPoint.distributor == party]
+    void $ submit party $ exerciseCmd archiver CapsuleArchiver_Archive with
+      actor = party, latest = fst $ last own
+      capsules = map fst own
+  rounds <- map fst <$> queryInterface @Api.Round feed.operator
+  void $ submit feed.operator $ exerciseCmd roundArchiver RoundArchiver_Archive with
+    actor = feed.operator, roundHead = feed.head, rounds
+
+-- With the archivers run after the publications, what a party holds does
+-- not depend on how many rounds were published; the markers alone grow,
+-- until a merge folds them into one per distributor.
+testRetentionBoundsEverythingButTheMarkers : Script ()
+testRetentionBoundsEverythingButTheMarkers = do
+  feed <- setup True
+  roundArchiver <- submit feed.operator $ createCmd RoundArchiver with
+    operator = feed.operator, definition = feed.definition, keptRounds = keptRoundCount, keepPeriod = minutes 1
+  capsuleArchivers <- forA (feed.operator :: map (.party) feed.distributors) $ \party ->
+    fmap (party,) $ submit party $ createCmd CapsuleArchiver with
+      distributor = party, definition = feed.definition, keptRounds = keptRoundCount, keepPeriod = minutes 1
+  let settle f = do
+        passTime (minutes 2)
+        archiveAll f roundArchiver capsuleArchivers
+        mapA held (roles f)
+  four <- publish PerClient 4 feed
+  [operator4, auditor4, reader4, distributor4, client4, accountant4] <- settle four
+  nine <- publish PerClient 5 four
+  [operator9, auditor9, reader9, distributor9, client9, accountant9] <- settle nine
+  [operator9, auditor9, reader9, client9] === [operator4, auditor4, reader4, client4]
+  -- Five more rounds are fifteen more markers of each distributor.
+  distributor9 - distributor4 === 15
+  accountant9 - accountant4 === 30
+
+  let d :: _ = nine.distributors
+  first :: others <- map fst <$> query @DistributionMarker d.party
+  _ <- submit d.party $ exerciseCmd first DistributionMarker_Merge with
+    actor = d.party, others
+  markers <- query @DistributionMarker d.party
+  length markers === 1
